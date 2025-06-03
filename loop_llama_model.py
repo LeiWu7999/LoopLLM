@@ -359,57 +359,6 @@ class LoopLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
     
-    def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        inputs_embeds=None,
-        cache_position=None,
-        **kwargs
-    ):
-        # 添加一个函数，不然用不了generate
-        # This is a simplified version based on LlamaForCausalLM
-        # It handles the preparation of inputs for the next token generation step
-
-        # Omit tokens covered by past_key_values
-        if past_key_values is not None:
-            if isinstance(past_key_values, Cache):
-                cache_length = past_key_values.get_seq_length()
-                past_length = past_key_values._seen_tokens
-            else:
-                cache_length = past_length = past_key_values[0][0].shape[2]
-
-            # Keep only the unprocessed tokens: 
-            # 1 - If the length of past is smaller than length of input, then input_ids contains the prefix of an input sequence.
-            # 2 - If the past_length is equal to input_ids length, then input_ids tokens have already been processed. Processing continues with a single new token.
-            # 3 - If the past_length is greater than input_ids length, then the input sequence is explicitely truncated when passing input_ids to generate. Tokens that are normally cut out from input_ids are found in past_key_values.
-            if cache_length < past_length and attention_mask is not None and attention_mask.shape[1] > past_length:
-                input_ids = input_ids[:, past_length:]
-            elif past_length < input_ids.shape[1]:
-                 input_ids = input_ids[:, past_length:]
-            #if past_length < input_ids.shape[1]:
-            #    input_ids = input_ids[:, past_length:]
-            elif cache_position is None:
-                input_ids = input_ids[:, -1:].contiguous()
-
-        # if `inputs_embeds` are passed, we only want to use them in the first generation step
-        if inputs_embeds is not None and past_key_values is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            # The `contiguous()` here is necessary to ensure that the input to `prepare_inputs_for_generation` is always contiguous
-            model_inputs = {"input_ids": input_ids.contiguous()} # Ensure input_ids is contiguous
-
-        model_inputs.update(
-            {
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache"),
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-            }
-        )
-        return model_inputs
-
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
