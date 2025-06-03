@@ -20,7 +20,7 @@ from loop_llama_config import LoopLlamaConfig
 from loop_cache_utils import LoopCache
 
 
-class LoopLlamaModel(LlamaPreTrainedModel):
+class LoopLlamaModel(LlamaModel):
     """
     支持循环层的LLaMA模型
     """
@@ -36,7 +36,8 @@ class LoopLlamaModel(LlamaPreTrainedModel):
             LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+
+        self.rotary_emb = LlamaRotaryEmbedding(config)
         
         self.gradient_checkpointing = False
         
@@ -48,6 +49,13 @@ class LoopLlamaModel(LlamaPreTrainedModel):
         self.kl_threshold = config.kl_threshold
         self.max_loop_count = config.max_loop_count
         
+        # # 添加 causal_mask 缓冲区，这是 _update_causal_mask 方法所需要的
+        # # 初始化一个较小的 causal_mask，会在需要时自动扩展
+        # # 使用较小的初始大小避免内存问题
+        # initial_causal_size = min(4096, config.max_position_embeddings)
+        # causal_mask = torch.full((initial_causal_size, initial_causal_size), fill_value=1, dtype=torch.bool)
+        # self.register_buffer("causal_mask", torch.triu(causal_mask, diagonal=1), persistent=False)
+        
         # Initialize weights and apply final processing
         self.post_init()
     
@@ -56,7 +64,7 @@ class LoopLlamaModel(LlamaPreTrainedModel):
     
     def set_input_embeddings(self, value):
         self.embed_tokens = value
-    
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -101,14 +109,16 @@ class LoopLlamaModel(LlamaPreTrainedModel):
             )
         
         if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            position_ids = cache_position.unsqueeze(0)      # [1, seq_len]
         
-        # 简化的attention mask处理
-        causal_mask = attention_mask
+        causal_mask = self._update_causal_mask(
+            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+        )       # 4维tensor [batch_size, key_value_length]->[batch_size, 1, query_length, key_value_length]
         
         hidden_states = inputs_embeds
         
         # create position embeddings to be shared across the decoder layers
+        # 不需要
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         
         # decoder layers
@@ -121,10 +131,7 @@ class LoopLlamaModel(LlamaPreTrainedModel):
             loop_start, loop_end = self.loop_layers
             
             # 执行循环前的层
-            for layer_idx in range(loop_start):
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
-                
+            for layer_idx in range(loop_start):         
                 decoder_layer = self.layers[layer_idx]
                 layer_outputs = decoder_layer(
                     hidden_states,
@@ -142,25 +149,26 @@ class LoopLlamaModel(LlamaPreTrainedModel):
                 
                 if output_attentions:
                     all_self_attns += (layer_outputs[1],)
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
             
             # 执行循环层
-            hidden_states = self._execute_loop_layers(
+            hidden_states, all_hidden_states = self._execute_loop_layers(
                 hidden_states=hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
+                output_hidden_states=output_hidden_states,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                all_hidden_states=all_hidden_states,
                 **kwargs,
             )
             
             # 执行循环后的层
             for layer_idx in range(loop_end + 1, self.config.num_hidden_layers):
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
-                
                 decoder_layer = self.layers[layer_idx]
                 layer_outputs = decoder_layer(
                     hidden_states,
@@ -176,14 +184,13 @@ class LoopLlamaModel(LlamaPreTrainedModel):
                 
                 hidden_states = layer_outputs[0]
                 
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
                 if output_attentions:
                     all_self_attns += (layer_outputs[1],)
         else:
             # 没有循环层，正常执行
             for decoder_layer in self.layers:
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
-                
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
@@ -198,14 +205,16 @@ class LoopLlamaModel(LlamaPreTrainedModel):
                 
                 hidden_states = layer_outputs[0]
                 
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
                 if output_attentions:
                     all_self_attns += (layer_outputs[1],)
-        
+
         hidden_states = self.norm(hidden_states)
         
         # add hidden states from the last decoder layer
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+        # if output_hidden_states:
+        #     all_hidden_states += (hidden_states,)
         
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -224,8 +233,9 @@ class LoopLlamaModel(LlamaPreTrainedModel):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        all_hidden_states: Optional[Tuple[torch.Tensor]] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         执行循环层的逻辑
         """
@@ -242,7 +252,7 @@ class LoopLlamaModel(LlamaPreTrainedModel):
             
             # 通过循环层块
             for relative_idx, decoder_layer in enumerate(loop_layers):
-                layer_idx = loop_start + relative_idx
+                layer_idx = loop_start + relative_idx   # 没用
                 
                 layer_outputs = decoder_layer(
                     current_hidden,
@@ -257,6 +267,8 @@ class LoopLlamaModel(LlamaPreTrainedModel):
                 )
                 
                 current_hidden = layer_outputs[0]
+                if all_hidden_states is not None:
+                    all_hidden_states += (current_hidden,)
             
             # 完成一次循环块后，增加循环步数
             if isinstance(past_key_values, LoopCache):
@@ -292,7 +304,7 @@ class LoopLlamaModel(LlamaPreTrainedModel):
         if isinstance(past_key_values, LoopCache):
             past_key_values.finish_current_forward_loops()
         
-        return hidden_states
+        return hidden_states, all_hidden_states
     
     def _check_convergence(self, prev_hidden: torch.Tensor, curr_hidden: torch.Tensor) -> bool:
         """
@@ -347,6 +359,57 @@ class LoopLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     def get_decoder(self):
         return self.model
     
+    def prepare_inputs_for_generation(
+        self,
+        input_ids,
+        past_key_values=None,
+        attention_mask=None,
+        inputs_embeds=None,
+        cache_position=None,
+        **kwargs
+    ):
+        # 添加一个函数，不然用不了generate
+        # This is a simplified version based on LlamaForCausalLM
+        # It handles the preparation of inputs for the next token generation step
+
+        # Omit tokens covered by past_key_values
+        if past_key_values is not None:
+            if isinstance(past_key_values, Cache):
+                cache_length = past_key_values.get_seq_length()
+                past_length = past_key_values._seen_tokens
+            else:
+                cache_length = past_length = past_key_values[0][0].shape[2]
+
+            # Keep only the unprocessed tokens: 
+            # 1 - If the length of past is smaller than length of input, then input_ids contains the prefix of an input sequence.
+            # 2 - If the past_length is equal to input_ids length, then input_ids tokens have already been processed. Processing continues with a single new token.
+            # 3 - If the past_length is greater than input_ids length, then the input sequence is explicitely truncated when passing input_ids to generate. Tokens that are normally cut out from input_ids are found in past_key_values.
+            if cache_length < past_length and attention_mask is not None and attention_mask.shape[1] > past_length:
+                input_ids = input_ids[:, past_length:]
+            elif past_length < input_ids.shape[1]:
+                 input_ids = input_ids[:, past_length:]
+            #if past_length < input_ids.shape[1]:
+            #    input_ids = input_ids[:, past_length:]
+            elif cache_position is None:
+                input_ids = input_ids[:, -1:].contiguous()
+
+        # if `inputs_embeds` are passed, we only want to use them in the first generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            # The `contiguous()` here is necessary to ensure that the input to `prepare_inputs_for_generation` is always contiguous
+            model_inputs = {"input_ids": input_ids.contiguous()} # Ensure input_ids is contiguous
+
+        model_inputs.update(
+            {
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+            }
+        )
+        return model_inputs
+
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,

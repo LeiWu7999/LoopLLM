@@ -1,0 +1,35 @@
+# Hydra配置文件 - interpretability_analysis
+defaults:
+  - _self_
+
+# 基础配置
+base:
+  num_samples: 10
+  batch_size: 1
+  output_dir: "interpretability_results"
+loop:
+  loop_count: 5
+  loop_layer: "all"
+model:
+  model_path: "meta-llama/Llama-3.2-1B-Instruct"
+
+
+
+# Hydra配置
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra:job.num}
+  job:
+    chdir: false
+
+# 多运行配置示例 (取消注释来使用)
+# hydra/launcher: basic
+# hydra/sweeper: basic
+
+# 参数扫描配置示例:
+# loop_count: 3,5,7,10
+# loop_start_layer: 10,12,14
+# loop_end_layer: 12,15,18

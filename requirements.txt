@@ -1,4 +1,12 @@
 torch>=2.0.0
 transformers>=4.30.0
 numpy>=1.21.0
-tokenizers>=0.13.0 
+tokenizers>=0.13.0
+datasets>=2.10.0
+scipy>=1.9.0
+psutil>=5.9.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+tqdm>=4.64.0
+hydra
+omegaconf>=2.3.0
