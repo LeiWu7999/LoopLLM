@@ -22,7 +22,7 @@ from loop_cache_utils import LoopCache
 
 class LoopLlamaModel(LlamaModel):
     """
-    支持循环层的LLaMA模型
+    支持循环层的LLaMA模型，注意all_hidden_states返回的是所有层的未经过norm的hidden_states
     """
     config_class = LoopLlamaConfig
     
@@ -239,6 +239,8 @@ class LoopLlamaModel(LlamaModel):
         """
         执行循环层的逻辑
         """
+        if self.loop_count <= 0:
+            return hidden_states, all_hidden_states
         loop_start, loop_end = self.loop_layers
         loop_layers = self.layers[loop_start:loop_end + 1]
         
@@ -275,7 +277,7 @@ class LoopLlamaModel(LlamaModel):
                 past_key_values.increment_loop_step()
             
             loop_step += 1
-            
+            hidden_states = current_hidden
             # 检查停止条件
             if self.loop_strategy == "fixed_count":
                 if loop_step >= self.loop_count:
@@ -298,7 +300,6 @@ class LoopLlamaModel(LlamaModel):
                     break
             
             prev_hidden_states = current_hidden.clone()
-            hidden_states = current_hidden
         
         # 完成循环后，对于合并策略模式，需要合并当前forward的结果
         if isinstance(past_key_values, LoopCache):
