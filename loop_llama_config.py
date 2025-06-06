@@ -79,9 +79,9 @@ class LoopLlamaConfig(LlamaConfig):
                         f"but the model has {self.num_hidden_layers} layers."
                     )
                 # 检查与前一个块是否重叠
-                if i > 0 and start_idx <= sorted_blocks[i-1][1]:
+                if i > 0 and start_idx <= self.loop_layers[i-1][1]:
                     raise ValueError(
-                        f"Loop blocks cannot overlap. Block {i-1} {sorted_blocks[i-1]} and block {i} {sorted_blocks[i]} are overlapping."
+                        f"Loop blocks cannot overlap. Block {i-1} {self.loop_layers[i-1]} and block {i} {self.loop_layers[i]} are overlapping."
                     )
 
 
