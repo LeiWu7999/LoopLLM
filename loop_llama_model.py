@@ -187,8 +187,8 @@ class LoopLlamaModel(LlamaModel):
         hidden_states = self.norm(hidden_states)
         
         # add hidden states from the last decoder layer
-        # if output_hidden_states:
-        #     all_hidden_states += (hidden_states,)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
         
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
