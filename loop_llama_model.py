@@ -42,20 +42,23 @@ class LoopLlamaModel(LlamaModel):
         self.gradient_checkpointing = False
         
         # 循环控制相关属性
-        self.loop_layers = config.loop_layers
         self.loop_strategy = config.loop_strategy
-        self.loop_count = config.loop_count
         self.cosine_threshold = config.cosine_threshold
         self.kl_threshold = config.kl_threshold
-        self.max_loop_count = config.max_loop_count
         
-        # # 添加 causal_mask 缓冲区，这是 _update_causal_mask 方法所需要的
-        # # 初始化一个较小的 causal_mask，会在需要时自动扩展
-        # # 使用较小的初始大小避免内存问题
-        # initial_causal_size = min(4096, config.max_position_embeddings)
-        # causal_mask = torch.full((initial_causal_size, initial_causal_size), fill_value=1, dtype=torch.bool)
-        # self.register_buffer("causal_mask", torch.triu(causal_mask, diagonal=1), persistent=False)
-        
+        # 将循环块信息处理成更易于使用的格式
+        self.loop_blocks = config.loop_layers if config.loop_layers is not None else []
+        self.loop_block_map = {}
+        if self.loop_blocks:
+            for i, block in enumerate(self.loop_blocks):
+                start_idx, end_idx = block
+                self.loop_block_map[start_idx] = {
+                    "end_idx": end_idx,
+                    "loop_count": config.loop_count[i],
+                    "max_loop_count": config.max_loop_count[i],
+                    "min_loop_count": config.min_loop_count[i],
+                }
+
         # Initialize weights and apply final processing
         self.post_init()
     
@@ -93,14 +96,11 @@ class LoopLlamaModel(LlamaModel):
         
         # 初始化缓存
         if use_cache and past_key_values is None:
-            if self.loop_layers is not None:
+            # 如果定义了循环块，则使用LoopCache
+            if self.loop_blocks:
                 past_key_values = LoopCache(config=self.config)
             else:
                 past_key_values = DynamicCache()
-        
-        # 如果是LoopCache，开始新的forward
-        if isinstance(past_key_values, LoopCache):
-            past_key_values.start_new_forward()
         
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -125,91 +125,65 @@ class LoopLlamaModel(LlamaModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         
-        # 执行前循环层
+        # --- 层执行逻辑 ---
         layer_idx = 0
-        if self.loop_layers is not None:
-            loop_start, loop_end = self.loop_layers
-            
-            # 执行循环前的层
-            for layer_idx in range(loop_start):         
-                decoder_layer = self.layers[layer_idx]
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
-                
-                hidden_states = layer_outputs[0]
-                
-                if output_attentions:
-                    all_self_attns += (layer_outputs[1],)
-                if output_hidden_states:
+        while layer_idx < self.config.num_hidden_layers:
+            # 检查当前层是否为循环块的起点
+            if output_hidden_states:
                     all_hidden_states += (hidden_states,)
-            
-            # 执行循环层
-            hidden_states, all_hidden_states = self._execute_loop_layers(
-                hidden_states=hidden_states,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                output_hidden_states=output_hidden_states,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                all_hidden_states=all_hidden_states,
-                **kwargs,
-            )
-            
-            # 执行循环后的层
-            for layer_idx in range(loop_end + 1, self.config.num_hidden_layers):
-                decoder_layer = self.layers[layer_idx]
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
-                
-                hidden_states = layer_outputs[0]
-                
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
-                if output_attentions:
-                    all_self_attns += (layer_outputs[1],)
-        else:
-            # 没有循环层，正常执行
-            for decoder_layer in self.layers:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
-                
-                hidden_states = layer_outputs[0]
-                
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
-                if output_attentions:
-                    all_self_attns += (layer_outputs[1],)
+            if layer_idx in self.loop_block_map:
+                block_info = self.loop_block_map[layer_idx]
+                loop_start = layer_idx
+                loop_end = block_info["end_idx"]
 
+                # 执行循环块
+                hidden_states, all_hidden_states, all_self_attns = self._execute_loop_layers(
+                    hidden_states=hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    all_hidden_states=all_hidden_states,
+                    all_self_attns=all_self_attns,
+                    # 循环块特定参数
+                    loop_start=loop_start,
+                    loop_end=loop_end,
+                    loop_count=block_info["loop_count"],
+                    max_loop_count=block_info["max_loop_count"],
+                    min_loop_count_for_block=block_info["min_loop_count"],
+                    **kwargs,
+                )
+                
+                # 将层索引快进到循环块之后
+                layer_idx = loop_end + 1
+            else:
+                # 执行单个普通层
+                decoder_layer = self.layers[layer_idx]
+                
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+                
+                hidden_states = layer_outputs[0]
+                
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
+                
+                # 移动到下一层
+                layer_idx += 1
+        
         hidden_states = self.norm(hidden_states)
         
         # add hidden states from the last decoder layer
@@ -229,28 +203,41 @@ class LoopLlamaModel(LlamaModel):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
-        output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        output_attentions: Optional[bool] = False,
+        output_hidden_states: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         all_hidden_states: Optional[Tuple[torch.Tensor]] = None,
+        all_self_attns: Optional[Tuple[torch.Tensor]] = None,
+        # 循环块参数
+        loop_start: int = 0,
+        loop_end: int = 0,
+        loop_count: int = 0,
+        max_loop_count: int = 0,
+        min_loop_count_for_block: int = 0,
         **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         执行循环层的逻辑
         """
-        if self.loop_count <= 0:
-            return hidden_states, all_hidden_states
-        loop_start, loop_end = self.loop_layers
+        if loop_count <= 0:
+            return hidden_states, all_hidden_states, all_self_attns
+            
         loop_layers = self.layers[loop_start:loop_end + 1]
+
+        if isinstance(past_key_values, LoopCache):
+            past_key_values.start_new_forward()
         
         # 不再重置循环缓存，而是使用跨forward复用的机制
         
         prev_hidden_states = None
         loop_step = 0
-        
-        while loop_step < self.max_loop_count:
+        while loop_step < max_loop_count:
             current_hidden = hidden_states
+
+            if output_hidden_states:
+                all_hidden_states += (current_hidden,)
             
             # 通过循环层块
             for relative_idx, decoder_layer in enumerate(loop_layers):
@@ -269,8 +256,8 @@ class LoopLlamaModel(LlamaModel):
                 )
                 
                 current_hidden = layer_outputs[0]
-                if all_hidden_states is not None:
-                    all_hidden_states += (current_hidden,)
+                if output_attentions and layer_outputs[1] is not None:
+                    all_self_attns += (layer_outputs[1],)
             
             # 完成一次循环块后，增加循环步数
             if isinstance(past_key_values, LoopCache):
@@ -280,13 +267,13 @@ class LoopLlamaModel(LlamaModel):
             hidden_states = current_hidden
             # 检查停止条件
             if self.loop_strategy == "fixed_count":
-                if loop_step >= self.loop_count:
+                if loop_step >= loop_count:
                     break
             elif self.loop_strategy == "dynamic_stop":
                 # 对于虚拟层模式，首先检查最小循环次数
                 if (isinstance(past_key_values, LoopCache) and 
                     past_key_values.kv_cache_mode == "virtual_layers" and
-                    loop_step < past_key_values.min_loop_count):
+                    loop_step < min_loop_count_for_block):
                     # 还没达到最小循环次数，强制继续循环
                     pass
                 elif prev_hidden_states is not None:
@@ -296,16 +283,17 @@ class LoopLlamaModel(LlamaModel):
                         break
                 
                 # 达到最大循环次数也要停止
-                if loop_step >= self.max_loop_count:
+                if loop_step >= max_loop_count:
                     break
             
             prev_hidden_states = current_hidden.clone()
+            
         
         # 完成循环后，对于合并策略模式，需要合并当前forward的结果
         if isinstance(past_key_values, LoopCache):
             past_key_values.finish_current_forward_loops()
         
-        return hidden_states, all_hidden_states
+        return hidden_states, all_hidden_states, all_self_attns
     
     def _check_convergence(self, prev_hidden: torch.Tensor, curr_hidden: torch.Tensor) -> bool:
         """
