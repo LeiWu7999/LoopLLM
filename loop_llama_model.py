@@ -129,8 +129,7 @@ class LoopLlamaModel(LlamaModel):
         layer_idx = 0
         while layer_idx < self.config.num_hidden_layers:
             # 检查当前层是否为循环块的起点
-            if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
+            
             if layer_idx in self.loop_block_map:
                 block_info = self.loop_block_map[layer_idx]
                 loop_start = layer_idx
@@ -161,6 +160,8 @@ class LoopLlamaModel(LlamaModel):
                 # 将层索引快进到循环块之后
                 layer_idx = loop_end + 1
             else:
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
                 # 执行单个普通层
                 decoder_layer = self.layers[layer_idx]
                 
@@ -236,11 +237,11 @@ class LoopLlamaModel(LlamaModel):
         while loop_step < max_loop_count:
             current_hidden = hidden_states
 
-            if output_hidden_states:
-                all_hidden_states += (current_hidden,)
             
             # 通过循环层块
             for relative_idx, decoder_layer in enumerate(loop_layers):
+                if output_hidden_states:
+                    all_hidden_states += (current_hidden,)
                 layer_idx = loop_start + relative_idx   # 没用
                 
                 layer_outputs = decoder_layer(
