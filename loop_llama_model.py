@@ -40,6 +40,8 @@ class LoopLlamaModel(LlamaModel):
         self.rotary_emb = LlamaRotaryEmbedding(config)
         
         self.gradient_checkpointing = False
+
+        self.training_mode = None
         
         # 循环控制相关属性
         self.loop_strategy = config.loop_strategy
@@ -87,6 +89,8 @@ class LoopLlamaModel(LlamaModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+        if self.training_mode:
+            use_cache = False
         
         if input_ids is None and inputs_embeds is None:
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
