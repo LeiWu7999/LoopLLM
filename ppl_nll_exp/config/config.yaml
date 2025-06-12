@@ -1,0 +1,59 @@
+# Hydra Configuration for LoopLlama PPL/NLL Experiment
+
+# General settings
+gpu_id: 0 # Default, will be overridden by run_parallel_layer_tests.sh or can be set in CLI
+random_seed: 42  # Set to null or remove for no fixed seed
+# output_dir is automatically set by Hydra to hydra.run.dir
+
+model:
+  # IMPORTANT: User must specify the base model name or path.
+  base_model_name_or_path: "/root/models/Llama-3.2-1B"
+
+  # Specify the indices of layers where the loop modification should be applied.
+  # This will be overridden by run_parallel_layer_tests.sh for specific layer tests (e.g., [L, L]).
+  loop_layers_idx: [0,0]
+
+dataset:
+  name: "wikitext"
+  subset: "wikitext-2-raw-v1"
+  split: "test"
+  text_column: "text" # Column containing text data in the dataset
+
+evaluation:
+  # Window size for model processing chunks during sliding window PPL calculation.
+  window_size: 4096
+
+  # Stride for the sliding window.
+  stride: 512
+
+  # List of loop counts (loop_n_times) to test for LoopLlama.
+  loop_n_times_list: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+
+# Hydra配置文件 - interpretability_analysis
+defaults:
+  - _self_
+
+# 基础配置 (This section might be for other scripts or older configurations)
+base:
+  num_samples: 10
+  batch_size: 1
+  output_dir: "interpretability_results"
+
+# Hydra配置
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra:job.num}
+  job:
+    chdir: false
+
+# 多运行配置示例 (取消注释来使用)
+# hydra/launcher: basic
+# hydra/sweeper: basic
+
+# 参数扫描配置示例:
+# loop_count: 3,5,7,10
+# loop_start_layer: 10,12,14
+# loop_end_layer: 12,15,18 

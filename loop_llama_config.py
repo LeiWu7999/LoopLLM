@@ -18,7 +18,9 @@ class LoopLlamaConfig(LlamaConfig):
         # 动态停止配置
         cosine_threshold: float = 0.95,  # 余弦相似度阈值
         kl_threshold: float = 0.01,  # KL散度阈值
+
         max_loop_count: Union[int, List[int]] = 10,  # 最大循环次数，可为单个整数或列表
+
         
         # KV缓存维护机制选择
         kv_cache_mode: str = "virtual_layers",  # "virtual_layers" or "merge_strategy"
