@@ -15,12 +15,18 @@ class LoopCache(Cache):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.loop_start, self.loop_end = config.loop_layers
+        self.loop_blocks = config.loop_layers
         self.kv_cache_mode = config.kv_cache_mode
         
         # 普通层的KV缓存
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
+        
+        # 创建一个从层索引到其循环块信息的映射，方便快速查找
+        self.layer_to_block_map: Dict[int, Tuple[int, List[int]]] = {}
+        for block_idx, block in enumerate(self.loop_blocks):
+            for layer_idx in range(block[0], block[1] + 1):
+                self.layer_to_block_map[layer_idx] = (block_idx, block)
         
         # 根据模式初始化循环层缓存
         if self.kv_cache_mode == "virtual_layers":
@@ -35,8 +41,8 @@ class LoopCache(Cache):
     
     def _init_virtual_layers_mode(self):
         """初始化虚拟层映射模式"""
-        self.virtual_layer_count = self.config.virtual_layer_count
-        self.min_loop_count = self.config.min_loop_count
+        self.virtual_layer_counts = self.config.virtual_layer_count
+        self.min_loop_counts = self.config.min_loop_count
         self.virtual_attention_mode = self.config.virtual_attention_mode
         
         # 为每个循环层创建虚拟层缓存
@@ -44,9 +50,10 @@ class LoopCache(Cache):
         self.virtual_key_cache: Dict[int, Dict[int, torch.Tensor]] = {}
         self.virtual_value_cache: Dict[int, Dict[int, torch.Tensor]] = {}
         
-        for layer_idx in range(self.loop_start, self.loop_end + 1):
-            self.virtual_key_cache[layer_idx] = {}
-            self.virtual_value_cache[layer_idx] = {}
+        for start, end in self.loop_blocks:
+            for layer_idx in range(start, end + 1):
+                self.virtual_key_cache[layer_idx] = {}
+                self.virtual_value_cache[layer_idx] = {}
     
     def _init_merge_strategy_mode(self):
         """初始化合并策略模式"""
@@ -61,19 +68,24 @@ class LoopCache(Cache):
         self.current_forward_key_history: Dict[int, List[torch.Tensor]] = {}
         self.current_forward_value_history: Dict[int, List[torch.Tensor]] = {}
         
-        for layer_idx in range(self.loop_start, self.loop_end + 1):
-            self.current_forward_key_history[layer_idx] = []
-            self.current_forward_value_history[layer_idx] = []
+        for start, end in self.loop_blocks:
+            for layer_idx in range(start, end + 1):
+                self.current_forward_key_history[layer_idx] = []
+                self.current_forward_value_history[layer_idx] = []
     
     def is_loop_layer(self, layer_idx: int) -> bool:
         """判断是否为循环层"""
-        return self.loop_start <= layer_idx <= self.loop_end
+        return layer_idx in self.layer_to_block_map
+    
+    def get_loop_block_info(self, layer_idx: int) -> Optional[Tuple[int, List[int]]]:
+        """获取层所在的循环块信息 (block_idx, [start, end])"""
+        return self.layer_to_block_map.get(layer_idx)
     
     def update(
         self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
+        key_states: torch.Tensor,       # （batch, num_heads, seq_len, head_dim）
+        value_states: torch.Tensor,     # （batch, num_heads, seq_len, head_dim）
+        layer_idx: int,                 # 层索引
         cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """更新缓存"""
@@ -122,6 +134,9 @@ class LoopCache(Cache):
     def _update_virtual_cache_tensor(self, cache_dict: Dict[int, torch.Tensor], new_tensor: torch.Tensor, 
                                     layer_idx: int, virtual_idx: int) -> None:
         """更新单个虚拟层缓存张量的通用方法"""
+        block_idx, _ = self.get_loop_block_info(layer_idx)
+        virtual_layer_count = self.virtual_layer_counts[block_idx]
+        
         if virtual_idx not in cache_dict[layer_idx]:
             # 首次添加
             cache_dict[layer_idx][virtual_idx] = new_tensor
@@ -132,13 +147,20 @@ class LoopCache(Cache):
             ], dim=-2)
         else:
             # 第二轮循环及以后,替换最后一个token的KV状态
-            current_cache = cache_dict[layer_idx][virtual_idx]
-            if current_cache.shape[-2] > 0:
-                cache_dict[layer_idx][virtual_idx] = torch.cat([
-                    current_cache[:, :, :-1, :], new_tensor
+            final_idx = virtual_layer_count - 1
+            if cache_dict[layer_idx][final_idx].shape[-2] > 0:
+                # 先将cache_dict[layer_idx]所有cache最后一个token向前移一个位置
+                for current_vitual_idx in range(0, final_idx):
+                    current_vitual_cache = cache_dict[layer_idx][current_vitual_idx][:, :, :-1, :]
+                    next_vitual_last_token = cache_dict[layer_idx][current_vitual_idx + 1][:, :, -1, :]
+                    cache_dict[layer_idx][current_vitual_idx] = torch.cat([
+                        current_vitual_cache, next_vitual_last_token
+                    ], dim=-2)
+                cache_dict[layer_idx][final_idx] = torch.cat([
+                    cache_dict[layer_idx][final_idx][:, :, :-1, :], new_tensor
                 ], dim=-2)
             else:
-                cache_dict[layer_idx][virtual_idx] = new_tensor
+                cache_dict[layer_idx][final_idx] = new_tensor
 
     def _update_virtual_layers_cache(
         self,
@@ -148,7 +170,11 @@ class LoopCache(Cache):
         cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """更新虚拟层映射模式的缓存"""
-        virtual_idx = self.current_forward_loop_step % self.virtual_layer_count
+        # 虚拟cache循环放置
+        # virtual_idx = self.current_forward_loop_step % self.virtual_layer_count
+
+        # 队列方式，先进先出
+        virtual_idx = self.current_forward_loop_step
         
         # 更新key和value缓存
         self._update_virtual_cache_tensor(self.virtual_key_cache, key_states, layer_idx, virtual_idx)
@@ -171,8 +197,11 @@ class LoopCache(Cache):
         key_parts = []
         value_parts = []
         
+        block_idx, _ = self.get_loop_block_info(layer_idx)
+        virtual_layer_count = self.virtual_layer_counts[block_idx]
+
         # 按虚拟层顺序拼接（注意：只拼接已存在的虚拟层）
-        for virtual_idx in range(self.virtual_layer_count):
+        for virtual_idx in range(virtual_layer_count):
             if virtual_idx in self.virtual_key_cache[layer_idx]:
                 key_parts.append(self.virtual_key_cache[layer_idx][virtual_idx])
                 value_parts.append(self.virtual_value_cache[layer_idx][virtual_idx])
@@ -188,6 +217,10 @@ class LoopCache(Cache):
     
     def _get_current_virtual_cache(self, layer_idx: int, virtual_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """获取当前虚拟层的缓存（串行模式）"""
+        block_idx, _ = self.get_loop_block_info(layer_idx)
+        virtual_layer_count = self.virtual_layer_counts[block_idx]
+        virtual_idx = virtual_idx % virtual_layer_count
+
         if virtual_idx in self.virtual_key_cache[layer_idx]:
             current_key = self.virtual_key_cache[layer_idx][virtual_idx]
             current_value = self.virtual_value_cache[layer_idx][virtual_idx]
@@ -227,14 +260,15 @@ class LoopCache(Cache):
         
         if self.kv_cache_mode == "merge_strategy":
             # 重置当前forward的循环历史
-            for layer_idx in range(self.loop_start, self.loop_end + 1):
-                self.current_forward_key_history[layer_idx] = []
-                self.current_forward_value_history[layer_idx] = []
+            for start, end in self.loop_blocks:
+                for layer_idx in range(start, end + 1):
+                    self.current_forward_key_history[layer_idx] = []
+                    self.current_forward_value_history[layer_idx] = []
     
     def finish_current_forward_loops(self):
         """完成当前forward的循环，合并结果到历史缓存"""
         if self.kv_cache_mode == "merge_strategy":
-            for layer_idx in range(self.loop_start, self.loop_end + 1):
+            for layer_idx in self.current_forward_key_history:
                 if self.current_forward_key_history[layer_idx]:
                     merged_key, merged_value = self._merge_current_forward_history(layer_idx)
                     
@@ -298,7 +332,9 @@ class LoopCache(Cache):
             if self.kv_cache_mode == "virtual_layers":
                 # 虚拟层模式：返回真实序列长度
                 # 可以通过任意一个虚拟层的长度来推断（因为都对应相同的token序列）
-                for virtual_idx in range(self.virtual_layer_count):
+                block_idx, _ = self.get_loop_block_info(layer_idx)
+                virtual_layer_count = self.virtual_layer_counts[block_idx]
+                for virtual_idx in range(virtual_layer_count):
                     if virtual_idx in self.virtual_key_cache[layer_idx]:
                         return self.virtual_key_cache[layer_idx][virtual_idx].shape[-2]
                 return 0
@@ -328,7 +364,9 @@ class LoopCache(Cache):
                 if self.virtual_attention_mode == "parallel":
                     # 并行模式：返回所有虚拟层的总长度
                     total_length = 0
-                    for virtual_idx in range(self.virtual_layer_count):
+                    block_idx, _ = self.get_loop_block_info(layer_idx)
+                    virtual_layer_count = self.virtual_layer_counts[block_idx]
+                    for virtual_idx in range(virtual_layer_count):
                         if virtual_idx in self.virtual_key_cache[layer_idx]:
                             total_length += self.virtual_key_cache[layer_idx][virtual_idx].shape[-2]
                     return total_length

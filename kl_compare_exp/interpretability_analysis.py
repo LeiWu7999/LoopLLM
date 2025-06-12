@@ -65,7 +65,7 @@ class LoopLLMInterpreter:
         print("正在初始化模型...")
         
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
             self.tokenizer.pad_token = self.tokenizer.eos_token
             self.model = LoopLlamaForCausalLM.from_pretrained(model_path, config=model_config, device_map="auto")
             self.model.eval()
@@ -89,7 +89,8 @@ class LoopLLMInterpreter:
         
         # 创建子目录名称
         if self.config.loop_layers is not None:
-            start_layer, end_layer = self.config.loop_layers
+            # 暂时只有一个循环块
+            start_layer, end_layer = self.config.loop_layers[0]
             loop_count = self.config.loop_count
             subdir_name = f"output_{loop_count}"
         else:
@@ -793,16 +794,13 @@ def main(cfg: DictConfig = None):
     elif isinstance(loop_layers, str):
         if loop_layers == "all":
             loop_layers = list(range(0, llama_config.num_hidden_layers))
+        else:
+            loop_layers = None
 
-    print(f"需要循环的层: {loop_layers}, 共{len(loop_layers)}层")
-    print(f"循环次数: {cfg.loop.loop_count}")
-    
-    for loop_layer in loop_layers:
-        print(f"正在分析第{loop_layer}层")
-
+    if loop_layers is None:
         loop_llama_config = LoopLlamaConfig(
             # LoopLLM特定配置
-            loop_layers=(loop_layer, loop_layer), 
+            loop_layers=None, 
             loop_strategy="fixed_count",
             loop_count=cfg.loop.loop_count,  # 从配置中获取循环次数
             kv_cache_mode="virtual_layers",
@@ -810,28 +808,52 @@ def main(cfg: DictConfig = None):
             min_loop_count=cfg.loop.loop_count,  # 最小循环次数与循环次数相同
             max_loop_count=cfg.loop.loop_count,  # 最大循环次数
             **config_dict
-        )
-        
-        # print("模型配置:")
-        # print(f"  词汇表大小: {loop_llama_config.vocab_size}")
-        # print(f"  隐藏层大小: {loop_llama_config.hidden_size}")
-        # print(f"  层数: {loop_llama_config.num_hidden_layers}")
-        # print(f"  循环层: {loop_llama_config.loop_layers}")
-        # print(f"  循环次数: {loop_llama_config.loop_count}")
-            
+        )           
         
         # 创建分析器，指定输出目录
         interpreter = LoopLLMInterpreter(loop_llama_config, model_path=model_path, output_dir=cfg.base.output_dir)
         
         # 运行分析 - 使用配置中的参数
         results = interpreter.run_analysis(num_samples=cfg.base.num_samples, batch_size=cfg.base.batch_size)
+    else:
+        print(f"需要循环的层: {loop_layers}, 共{len(loop_layers)}层")
+        print(f"循环次数: {cfg.loop.loop_count}")
         
-        # if results:
-        #     print("\n分析结果摘要:")
-        #     print(f"每层与最后一层的KL散度: {results['layer_vs_final_kl']}")
-        #     print(f"KL散度矩阵形状: {results['all_pairs_kl'].shape}")
-        # else:
-        #     print("❌ 分析失败")
+        for loop_layer in loop_layers:
+            print(f"正在分析第{loop_layer}层")
+
+            loop_llama_config = LoopLlamaConfig(
+                # LoopLLM特定配置
+                loop_layers=[(loop_layer, loop_layer)], 
+                loop_strategy="fixed_count",
+                loop_count=cfg.loop.loop_count,  # 从配置中获取循环次数
+                kv_cache_mode="virtual_layers",
+                virtual_layer_count=cfg.loop.loop_count,  # 虚拟层数量与循环次数相同
+                min_loop_count=cfg.loop.loop_count,  # 最小循环次数与循环次数相同
+                max_loop_count=cfg.loop.loop_count,  # 最大循环次数
+                **config_dict
+            )
+            
+            # print("模型配置:")
+            # print(f"  词汇表大小: {loop_llama_config.vocab_size}")
+            # print(f"  隐藏层大小: {loop_llama_config.hidden_size}")
+            # print(f"  层数: {loop_llama_config.num_hidden_layers}")
+            # print(f"  循环层: {loop_llama_config.loop_layers}")
+            # print(f"  循环次数: {loop_llama_config.loop_count}")
+                
+            
+            # 创建分析器，指定输出目录
+            interpreter = LoopLLMInterpreter(loop_llama_config, model_path=model_path, output_dir=cfg.base.output_dir)
+            
+            # 运行分析 - 使用配置中的参数
+            results = interpreter.run_analysis(num_samples=cfg.base.num_samples, batch_size=cfg.base.batch_size)
+            
+            # if results:
+            #     print("\n分析结果摘要:")
+            #     print(f"每层与最后一层的KL散度: {results['layer_vs_final_kl']}")
+            #     print(f"KL散度矩阵形状: {results['all_pairs_kl'].shape}")
+            # else:
+            #     print("❌ 分析失败")
 
 
 if __name__ == "__main__":
