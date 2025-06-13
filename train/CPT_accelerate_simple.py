@@ -1,6 +1,6 @@
 import sys
 import os
-sys.path.append('..')
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transformers import TrainingArguments, Trainer
 import torch
@@ -10,16 +10,20 @@ from transformers import AutoTokenizer , AutoModelForCausalLM
 from transformers import LlamaConfig
 from datasets import load_dataset
 from accelerate import Accelerator
+from datetime import datetime
+
+current_time = datetime.now()
+# print(f"当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
 ## 参数设置
 ## 数据参数
-data_name_or_path = "EleutherAI/the_pile_deduplicated"
+data_name_or_path = "openai/gsm8k"
 max_length = 1024
 ## 训练参数
 per_device_batch_size = 1
 num_epochs = 3
 learning_rate = 2e-4
-
+gradient_accumulation_steps = 16 # 确保和deepspeed一致
 ## 循环设置
 loop_layers = [(6,8)]
 loop_strategy = "fixed_count"
@@ -41,7 +45,23 @@ config = LoopLlamaConfig(
         virtual_attention_mode=virtual_attention_mode,
         **config_dict
     )
-  
+
+def loading_dataset(data_name_or_path, text_column_name): # 默认要被训练的text字段为“text”
+    print(f"加载数据集: {data_name_or_path}")
+    dataset = load_dataset(data_name_or_path,"main")
+    print(f"原始训练数据集长度: {len(dataset['train'])}")
+    if "test" not in dataset.keys():
+        print("数据集没有test集，将按9：1划分训练集为测试集")
+        dataset["test"] = dataset["train"].select(range(int(len(dataset["train"]) * 0.9), len(dataset["train"])))
+        dataset["train"] = dataset["train"].select(range(int(len(dataset["train"]) * 0.9)))
+    # print(f"原始数据集的字段: {dataset['train'].column_names}")
+    if "text" not in dataset["train"].column_names:
+        print(f"将{text_column_name}更名为text字段，用于训练")
+        dataset["train"] = dataset["train"].map(lambda x: {"text": x[text_column_name]})
+        dataset["test"] = dataset["test"].map(lambda x: {"text": x[text_column_name]})
+    # print(f"处理后数据集的字段: {dataset['train'].column_names}")
+    return dataset
+
 def preprocess_function(examples, tokenizer):
     """将数据集中的question和answer转换为模型可接受的格式"""
     texts = examples["text"]
@@ -84,13 +104,13 @@ def CPT_train(loop_llama_model, dataset, tokenizer, freeze=False):
         num_train_epochs=num_epochs,
         per_device_train_batch_size=per_device_batch_size,
         per_device_eval_batch_size=per_device_batch_size,
-        gradient_accumulation_steps=8,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         warmup_steps=1,
         learning_rate=learning_rate,
         report_to="tensorboard",
         logging_steps=10,
         save_strategy="epoch",
-        logging_dir=f'./logs_f{loop_layers[0][0]}_{loop_layers[0][1]}_{loop_count[0]}',
+        logging_dir=f'./logs_{current_time.strftime("%Y%m%d_%Hh%Mm%Ss")}',
         eval_strategy="epoch",
         save_total_limit=2,
         bf16=True,
@@ -111,13 +131,12 @@ def CPT_train(loop_llama_model, dataset, tokenizer, freeze=False):
 if __name__ == "__main__":
     ## 加载模型
     loop_llama_model = LoopLlamaForCausalLM.from_pretrained(original_llama_model_name, config=config)
-    origin_llama_model = AutoModelForCausalLM.from_pretrained(original_llama_model_name)
+    # origin_llama_model = AutoModelForCausalLM.from_pretrained(original_llama_model_name)
     tokenizer = AutoTokenizer.from_pretrained(original_llama_model_name, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     loop_llama_model.model.training_mode = True
-    
     ## 加载数据
-    dataset = load_dataset(data_name_or_path)
+    dataset = loading_dataset(data_name_or_path, text_column_name="question") # text_column_name为数据集的query字段
     
     # 开始训练
     CPT_train(loop_llama_model, dataset, tokenizer) 
