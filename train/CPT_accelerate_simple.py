@@ -2,14 +2,16 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from transformers import TrainingArguments, Trainer
+from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
 import torch
 from loop_llama_config import LoopLlamaConfig
 from loop_llama_model import LoopLlamaForCausalLM
 from transformers import AutoTokenizer , AutoModelForCausalLM
 from transformers import LlamaConfig
-from datasets import load_dataset
+from datasets import load_from_disk
 from accelerate import Accelerator
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
 from datetime import datetime
 
 current_time = datetime.now()
@@ -17,8 +19,8 @@ current_time = datetime.now()
 
 ## 参数设置
 ## 数据参数
-data_name_or_path = "openai/gsm8k"
-max_length = 1024
+data_name_or_path = "./packed_data/"
+max_length = 2048 # This should match the SEQ_LENGTH in tokenize_and_pack.py
 ## 训练参数
 per_device_batch_size = 1
 num_epochs = 3
@@ -33,7 +35,7 @@ virtual_layer_count = [3]
 virtual_attention_mode = "parallel"
 
 ## 模型设置
-original_llama_model_name = "meta-llama/Llama-3.2-1B"
+original_llama_model_name = "mistralai/Mistral-7B-v0.1" 
 llama_config = LlamaConfig.from_pretrained(original_llama_model_name)
 config_dict = llama_config.to_dict()
 config = LoopLlamaConfig(
@@ -46,34 +48,41 @@ config = LoopLlamaConfig(
         **config_dict
     )
 
-def loading_dataset(data_name_or_path, text_column_name): # 默认要被训练的text字段为“text”
-    print(f"加载数据集: {data_name_or_path}")
-    dataset = load_dataset(data_name_or_path,"main")
-    print(f"原始训练数据集长度: {len(dataset['train'])}")
-    if "test" not in dataset.keys():
-        print("数据集没有test集，将按9：1划分训练集为测试集")
-        dataset["test"] = dataset["train"].select(range(int(len(dataset["train"]) * 0.9), len(dataset["train"])))
-        dataset["train"] = dataset["train"].select(range(int(len(dataset["train"]) * 0.9)))
-    # print(f"原始数据集的字段: {dataset['train'].column_names}")
-    if "text" not in dataset["train"].column_names:
-        print(f"将{text_column_name}更名为text字段，用于训练")
-        dataset["train"] = dataset["train"].map(lambda x: {"text": x[text_column_name]})
-        dataset["test"] = dataset["test"].map(lambda x: {"text": x[text_column_name]})
-    # print(f"处理后数据集的字段: {dataset['train'].column_names}")
-    return dataset
+@dataclass
+class DataCollatorForCrossDocumentAttention:
+    """
+    Data collator that creates a custom attention mask to prevent attention
+    between different documents within a single packed sequence.
+    """
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # Standard collation to batch tensors
+        input_ids = torch.tensor([f["input_ids"] for f in features], dtype=torch.long)
+        document_ids = torch.tensor([f["document_ids"] for f in features], dtype=torch.long)
+        
+        batch_size, seq_length = input_ids.shape
+        
+        # Create the attention mask
+        attention_mask = torch.zeros((batch_size, seq_length, seq_length), dtype=torch.float32)
 
-def preprocess_function(examples, tokenizer):
-    """将数据集中的question和answer转换为模型可接受的格式"""
-    texts = examples["text"]
-    tokenized_inputs = tokenizer(
-        texts,
-        padding="max_length",
-        truncation=True,
-        max_length=max_length
-    )
-    tokenized_inputs["labels"] = tokenized_inputs["input_ids"].copy()
-    return tokenized_inputs
+        for i in range(batch_size):
+            # 1. Create a causal mask (lower triangular)
+            causal_mask = torch.tril(torch.ones((seq_length, seq_length), dtype=torch.bool))
+            
+            # 2. Create a document boundary mask
+            doc_ids = document_ids[i]
+            # `doc_ids_matrix[j, k] = 1` if token j and k are from the same document
+            doc_ids_matrix = doc_ids.unsqueeze(1) == doc_ids.unsqueeze(0)
+            
+            # 3. Combine them. The final mask is 1 only if both conditions are met.
+            combined_mask = causal_mask & doc_ids_matrix
+            attention_mask[i] = combined_mask.float()
 
+        return {
+            "input_ids": input_ids,
+            "labels": input_ids.clone(), # In LLM pre-training, labels are the input_ids
+            "attention_mask": attention_mask
+        }
+  
 def CPT_train(loop_llama_model, dataset, tokenizer, freeze=False):
     if freeze:
         for name, param in loop_llama_model.named_parameters():
@@ -91,12 +100,8 @@ def CPT_train(loop_llama_model, dataset, tokenizer, freeze=False):
     print(f"Trainable parameters: {trainable_params} ({100 * trainable_params / total_params:.2f}%)")
     print("--------------------------------")
     
-    # 预处理数据集
-    tokenized_dataset = dataset.map(
-        lambda examples: preprocess_function(examples, tokenizer),
-        batched=True,
-        remove_columns=dataset["train"].column_names
-    )
+    # Instantiate our custom data collator
+    data_collator = DataCollatorForCrossDocumentAttention()
 
     # 训练参数 - Accelerate会自动处理多GPU
     training_args = TrainingArguments(
@@ -121,8 +126,9 @@ def CPT_train(loop_llama_model, dataset, tokenizer, freeze=False):
     trainer = Trainer(
         model=loop_llama_model,
         args=training_args,
-        train_dataset=tokenized_dataset["train"],
-        eval_dataset=tokenized_dataset["test"]
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["validation"], # MODIFIED: Use the correct split name
+        data_collator=data_collator # ADDED: Use our custom collator
     )
     
     trainer.train()
@@ -136,7 +142,13 @@ if __name__ == "__main__":
     tokenizer.pad_token = tokenizer.eos_token
     loop_llama_model.model.training_mode = True
     ## 加载数据
-    dataset = loading_dataset(data_name_or_path, text_column_name="question") # text_column_name为数据集的query字段
+    dataset = load_from_disk(data_name_or_path)
     
+    # Split the dataset if it doesn't have train/validation splits
+    if "train" not in dataset:
+        print("Dataset does not contain train/validation splits. Assuming single split and creating them.")
+        # This is a fallback. The packing script should create train/validation folders.
+        dataset = dataset.train_test_split(test_size=0.01, seed=42)
+
     # 开始训练
     CPT_train(loop_llama_model, dataset, tokenizer) 
