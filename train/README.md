@@ -15,6 +15,9 @@ cd 到项目目录LoopLLM，执行以下命令
 accelerate launch CPT_accelerate_simple.py
 ```
 # 启动TensorBoard
-```
-tensorboard --logdir="tensorboard文件路径" --port=6006
+`--logdir` 参数应该指向包含 event 文件的目录，而不是具体的文件。
+
+例如，如果您的日志在 `logs_20250618_00h32m05s` 目录中，您应该使用该目录作为路径。
+```bash
+tensorboard --logdir="logs_20250618_00h32m05s" --port=6006
 ```

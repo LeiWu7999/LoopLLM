@@ -20,7 +20,9 @@ class LoopLlamaConfig(LlamaConfig):
         kl_threshold: float = 0.01,  # KL散度阈值
 
         max_loop_count: Union[int, List[int]] = 10,  # 最大循环次数，可为单个整数或列表
-
+        
+        # 训练时是否启用动态循环次数采样
+        use_dynamic_loop_sampling: bool = False,
         
         # KV缓存维护机制选择
         kv_cache_mode: str = "virtual_layers",  # "virtual_layers" or "merge_strategy"
@@ -35,6 +37,10 @@ class LoopLlamaConfig(LlamaConfig):
         # 合并策略模式参数 (m->1)
         merge_strategy: str = "ema",  # "ema", "average", "last"
         merge_ema_alpha: float = 0.7,  # EMA参数
+        
+        # 训练时是否启用KV缓存，以实现有状态循环
+        use_kv_cache_in_training: bool = True,
+        
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -53,6 +59,10 @@ class LoopLlamaConfig(LlamaConfig):
         self.virtual_attention_mode = virtual_attention_mode
         self.merge_strategy = merge_strategy
         self.merge_ema_alpha = merge_ema_alpha
+
+        # 训练配置
+        self.use_dynamic_loop_sampling = use_dynamic_loop_sampling
+        self.use_kv_cache_in_training = use_kv_cache_in_training
         
         # 验证配置
         self._validate_loop_config()
@@ -66,7 +76,7 @@ class LoopLlamaConfig(LlamaConfig):
             self.virtual_layer_count = [self.virtual_layer_count] * len(self.loop_layers) if isinstance(self.virtual_layer_count, int) else self.virtual_layer_count
             self.min_loop_count = [self.min_loop_count] * len(self.loop_layers) if isinstance(self.min_loop_count, int) else self.min_loop_count
 
-            if not isinstance(self.loop_layers, list) or not all(isinstance(i, tuple) and len(i) == 2 for i in self.loop_layers):
+            if not isinstance(self.loop_layers, list) or not all(isinstance(i, list) and len(i) == 2 for i in self.loop_layers):
                 raise ValueError("`loop_layers` must be a list of lists, where each inner list contains two integers.")
 
             # 检查循环次数配置
@@ -88,16 +98,20 @@ class LoopLlamaConfig(LlamaConfig):
 
 
             for i in range(len(self.loop_layers)):
-                if self.virtual_layer_count[i] <= 0:
-                    raise ValueError(f"虚拟层数量必须大于0: {self.virtual_layer_count[i]}")
-                if self.min_loop_count[i] < self.virtual_layer_count[i]:
-                    raise ValueError(f"Block {i}: min_loop_count ({self.min_loop_count[i]}) must be >= virtual_layer_count ({self.virtual_layer_count[i]}).")
-                if self.virtual_attention_mode not in ["parallel", "serial"]:
-                    raise ValueError(f"Unsupported virtual attention mode: {self.virtual_attention_mode}")
-                if self.max_loop_count[i] < self.min_loop_count[i]:
-                    raise ValueError(f"Block {i}: max_loop_count ({self.max_loop_count[i]}) must be >= min_loop_count ({self.min_loop_count[i]}).")
-                if self.loop_count[i] != self.virtual_layer_count[i]:
-                    raise ValueError(f"Block {i}: In virtual_layers mode, loop_count ({self.loop_count[i]}) must be equal to virtual_layer_count ({self.virtual_layer_count[i]}).")
+                if self.kv_cache_mode == "virtual_layers":
+                    if self.virtual_layer_count[i] <= 0:
+                        raise ValueError(f"virtual_layer_count must be > 0: {self.virtual_layer_count[i]}")
+                    if self.min_loop_count[i] < self.virtual_layer_count[i]:
+                        raise ValueError(f"Block {i}: min_loop_count ({self.min_loop_count[i]}) must be >= virtual_layer_count ({self.virtual_layer_count[i]}).")
+                    if self.virtual_attention_mode not in ["parallel", "serial"]:
+                        raise ValueError(f"Unsupported virtual attention mode: {self.virtual_attention_mode}")
+                    if self.max_loop_count[i] < self.min_loop_count[i]:
+                        raise ValueError(f"Block {i}: max_loop_count ({self.max_loop_count[i]}) must be >= min_loop_count ({self.min_loop_count[i]}).")
+                
+                # 当不使用动态循环次数采样时，在virtual_layers模式下，loop_count必须等于virtual_layer_count
+                if not self.use_dynamic_loop_sampling and self.kv_cache_mode == "virtual_layers":
+                    if self.loop_count[i] != self.virtual_layer_count[i]:
+                        raise ValueError(f"Block {i}: In virtual_layers mode without dynamic sampling, loop_count ({self.loop_count[i]}) must be equal to virtual_layer_count ({self.virtual_layer_count[i]}).")
 
         if self.loop_strategy not in ["fixed_count", "dynamic_stop"]:
             raise ValueError(f"Unsupported loop strategy: {self.loop_strategy}")
