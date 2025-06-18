@@ -264,7 +264,7 @@ class PplValidationTrainer(Trainer):
         
         return output
   
-def CPT_train(loop_llama_model, dataset, tokenizer, training_config, freeze=False):
+def CPT_train(loop_llama_model, dataset, tokenizer, training_config, resume_from_checkpoint=None, freeze=False):
     if freeze:
         loop_layers = loop_llama_model.config.loop_layers
         for name, param in loop_llama_model.named_parameters():
@@ -345,12 +345,13 @@ def CPT_train(loop_llama_model, dataset, tokenizer, training_config, freeze=Fals
         **trainer_init_kwargs
     )
     
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     return trainer
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to the training configuration file.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint to resume training from.")
     args = parser.parse_args()
 
     # Load configurations
@@ -405,4 +406,4 @@ if __name__ == "__main__":
         dataset = dataset.train_test_split(test_size=0.01, seed=42)
 
     # 开始训练
-    CPT_train(loop_llama_model, dataset, tokenizer, training_config) 
+    CPT_train(loop_llama_model, dataset, tokenizer, training_config, resume_from_checkpoint=args.resume_from_checkpoint) 
