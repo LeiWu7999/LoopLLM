@@ -63,6 +63,7 @@ def calculate_ppl_loss(model, tokenizer, encodings, device, window_size, stride,
         if num_to_mask_at_start < 0: 
             num_to_mask_at_start = 0
         
+        # 在 Hugging Face 的框架中，-100 会被损失函数忽略。
         target_labels[:, :num_to_mask_at_start] = -100
 
         if (target_labels == -100).all().item():

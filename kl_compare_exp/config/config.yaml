@@ -8,10 +8,10 @@ base:
   batch_size: 1
   output_dir: "interpretability_results"
 loop:
-  loop_count: 5
-  loop_layer: "all"
+  loop_count: 1
+  loop_layer: None
 model:
-  model_path: "meta-llama/Llama-3.2-1B-Instruct"
+  model_path: "meta-llama/Llama-3.2-1B"
 
 
 
