@@ -109,6 +109,8 @@ class DynamicLoopCountDataCollatorForCrossDocumentAttention:
     """
     config: LoopLlamaConfig
     dynamic_sampling_params: dict
+    # 需要匹配query的类型（如bfloat16）
+    dtype: torch.dtype = torch.float32
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Standard collation to batch tensors
@@ -118,10 +120,10 @@ class DynamicLoopCountDataCollatorForCrossDocumentAttention:
         batch_size, seq_length = input_ids.shape
         
         # Create the attention mask
-        attention_mask = torch.zeros((batch_size, seq_length, seq_length), dtype=torch.float32)
+        attention_mask = torch.zeros((batch_size, seq_length, seq_length), dtype=self.dtype)
 
         for i in range(batch_size):
-            # 1. Create a causal mask (lower triangular)
+            # 1. Create a causal mask (lower triangular) torch.tril() - 提取矩阵的下三角部分，上三角部分变为False
             causal_mask = torch.tril(torch.ones((seq_length, seq_length), dtype=torch.bool))
             
             # 2. Create a document boundary mask
@@ -131,7 +133,7 @@ class DynamicLoopCountDataCollatorForCrossDocumentAttention:
             
             # 3. Combine them. The final mask is 1 only if both conditions are met.
             combined_mask = causal_mask & doc_ids_matrix
-            attention_mask[i] = combined_mask.float()
+            attention_mask[i] = combined_mask.to(self.dtype)
             
         # Dynamically sample loop count for the batch.
         # This sampling is synchronized across all workers to ensure workload balance.
@@ -267,7 +269,7 @@ class PplValidationTrainer(Trainer):
         return output
   
 def CPT_train(loop_llama_model, dataset, tokenizer, training_config, resume_from_checkpoint=None, freeze=False):
-    if freeze:
+    if freeze and loop_llama_model.config.loop_layers:
         loop_layers = loop_llama_model.config.loop_layers
         for name, param in loop_llama_model.named_parameters():
             if name.split('.')[2] in [str(x) for x in range(loop_layers[0][0], loop_layers[0][1] + 1)]:
@@ -289,7 +291,8 @@ def CPT_train(loop_llama_model, dataset, tokenizer, training_config, resume_from
         print("Using data collator with dynamic loop count sampling.")
         data_collator = DynamicLoopCountDataCollatorForCrossDocumentAttention(
             config=loop_llama_model.config,
-            dynamic_sampling_params=training_config['dynamic_sampling_params']
+            dynamic_sampling_params=training_config['dynamic_sampling_params'],
+            dtype=loop_llama_model.dtype
         )
     else:
         print("Using standard data collator.")
@@ -301,7 +304,7 @@ def CPT_train(loop_llama_model, dataset, tokenizer, training_config, resume_from
     output_dir = training_config['training_params']['output_dir_template'].format(
         loop_llama_model.config.loop_layers[0][0], 
         loop_llama_model.config.loop_layers[0][1]
-    )
+    ) if loop_llama_model.config.loop_layers else training_config['training_params']['output_dir_template'].format('None', 'None')
     logging_dir = training_config['training_params']['logging_dir_template'].format(current_time)
 
     # 训练参数 - Accelerate会自动处理多GPU
@@ -329,6 +332,10 @@ def CPT_train(loop_llama_model, dataset, tokenizer, training_config, resume_from
         bf16=training_config['training_params']['bf16'],
         dataloader_pin_memory=training_config['training_params']['dataloader_pin_memory'],
         remove_unused_columns=training_config['training_params']['remove_unused_columns'],
+        per_device_eval_batch_size=training_config['training_params']['per_device_eval_batch_size'],
+        # prediction_loss_only=True,
+        # eval_accumulation_steps=1,
+        # eval_on_start=True,
     )
     
     ppl_eval_config = training_config.get('ppl_eval_config')
@@ -379,6 +386,10 @@ if __name__ == "__main__":
     # Load configurations
     training_config = load_config(args.config)
     loop_conf = training_config['loop_config']
+    if not loop_conf['use_loop']:
+        print("Warning: Loop is disabled in the configuration. Training will be performed without loop.")
+        loop_conf['loop_layers'] = None
+        loop_conf['loop_count'] = None
     model_conf = training_config['model_config']
     data_conf = training_config['data_params']
 
