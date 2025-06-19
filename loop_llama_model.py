@@ -184,16 +184,35 @@ class LoopLlamaModel(LlamaModel):
                 # 执行单个普通层
                 decoder_layer = self.layers[layer_idx]
                 
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                )
+                if self.gradient_checkpointing and self.training:
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs)
+                        return custom_forward
+
+                    layer_outputs = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(decoder_layer),
+                        hidden_states,
+                        causal_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                        position_embeddings,
+                        use_reentrant=False,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                    )
                 
                 hidden_states = layer_outputs[0]
                 
@@ -260,16 +279,35 @@ class LoopLlamaModel(LlamaModel):
                 if output_hidden_states:
                     all_hidden_states += (current_hidden,)
                 
-                layer_outputs = decoder_layer(
-                    current_hidden,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                )
+                if self.gradient_checkpointing and self.training:
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs)
+                        return custom_forward
+
+                    layer_outputs = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(decoder_layer),
+                        current_hidden,
+                        attention_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                        position_embeddings,
+                        use_reentrant=False,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        current_hidden,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                    )
                 
                 current_hidden = layer_outputs[0]
                 if output_attentions and layer_outputs[1] is not None:
@@ -328,6 +366,24 @@ class LoopLlamaModel(LlamaModel):
         # 计算KL散度（需要通过unembedding层投影到概率空间）
         # 这里简化实现，只使用余弦相似度
         return False
+
+    # This is the method that will be called by the Trainer
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """
+        Activates gradient checkpointing for the model.
+        We override the default behavior to apply checkpointing at the loop level.
+        """
+        if not self.supports_gradient_checkpointing:
+            raise ValueError("This model does not support gradient checkpointing.")
+        self.gradient_checkpointing = True
+        print("Manual gradient checkpointing enabled for LoopLlamaModel.")
+
+    def gradient_checkpointing_disable(self):
+        """
+        Deactivates gradient checkpointing for the model.
+        """
+        self.gradient_checkpointing = False
+        print("Manual gradient checkpointing disabled for LoopLlamaModel.")
 
 
 class LoopLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):

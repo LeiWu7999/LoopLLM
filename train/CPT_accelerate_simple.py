@@ -3,6 +3,8 @@ import os
 import json
 import argparse
 from datetime import datetime
+from tqdm import tqdm
+import torch.multiprocessing as mp
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -17,14 +19,13 @@ from accelerate import Accelerator
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
-from tqdm import tqdm
 
 def load_config(config_path):
     with open(config_path, 'r') as f:
         config = json.load(f)
     return config
 
-def calculate_ppl_loss(model, tokenizer, encodings, device, window_size, stride):
+def calculate_ppl_loss(model, tokenizer, encodings, device, window_size, stride, is_evaluating=False):
     """
     Calculates Perplexity (PPL) and Negative Log-Likelihood (NLL) for a given model
     using a sliding window approach.
@@ -134,11 +135,11 @@ class DynamicLoopCountDataCollatorForCrossDocumentAttention:
         # Dynamically sample loop count for the batch.
         # This sampling is synchronized across all workers to ensure workload balance.
         if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-            # Determine the current device for this worker.
-            current_device = torch.device("cuda", torch.cuda.current_device())
-
-            # In a distributed setting, only rank 0 samples the loop count.
+            # In a distributed setting, we use broadcast_object_list to sync the Python integer
+            # across all ranks. This method is device-agnostic and works for both
+            # CUDA GPUs (NCCL backend) and Ascend NPUs (HCCL backend).
             if torch.distributed.get_rank() == 0:
+                # Rank 0 samples the loop count
                 r_bar = self.dynamic_sampling_params['r_bar']
                 sigma = self.dynamic_sampling_params['sigma']
                 max_loops = self.dynamic_sampling_params['max_loops']
@@ -148,17 +149,17 @@ class DynamicLoopCountDataCollatorForCrossDocumentAttention:
                 rate = np.exp(tau)
                 sampled_value = np.random.poisson(rate) + 1
                 
-                # Create tensor on the correct GPU device.
-                sampled_loop_count_tensor = torch.tensor(min(sampled_value, max_loops), dtype=torch.long, device=current_device)
+                # Use a list to hold the value for broadcasting
+                sampled_loop_count_container = [min(sampled_value, max_loops)]
             else:
-                # Other ranks create an empty tensor on their respective GPU device to receive the value.
-                sampled_loop_count_tensor = torch.tensor(0, dtype=torch.long, device=current_device)
+                # Other ranks initialize a placeholder list
+                sampled_loop_count_container = [0]
             
-            # Broadcast the sampled loop count from rank 0 to all other ranks.
-            # The tensor is now on the GPU, which is what the 'nccl' backend expects.
-            torch.distributed.broadcast(sampled_loop_count_tensor, src=0)
+            # Broadcast the object list from rank 0 to all other ranks.
+            torch.distributed.broadcast_object_list(sampled_loop_count_container, src=0)
             
-            sampled_loop_count = sampled_loop_count_tensor.item()
+            # Extract the synchronized value
+            sampled_loop_count = sampled_loop_count_container[0]
         else:
             # For single-worker or non-distributed training, sample directly.
             r_bar = self.dynamic_sampling_params['r_bar']
@@ -315,6 +316,7 @@ def CPT_train(loop_llama_model, dataset, tokenizer, training_config, resume_from
         logging_steps=training_config['training_params']['logging_steps'],
         save_strategy=training_config['training_params']['save_strategy'],
         eval_strategy=training_config['training_params']['eval_strategy'],
+        eval_steps=training_config['training_params']['eval_steps'],
         save_total_limit=training_config['training_params']['save_total_limit'],
         bf16=training_config['training_params']['bf16'],
         dataloader_pin_memory=training_config['training_params']['dataloader_pin_memory'],
@@ -349,6 +351,18 @@ def CPT_train(loop_llama_model, dataset, tokenizer, training_config, resume_from
     return trainer
     
 if __name__ == "__main__":
+    # Set the multiprocessing start method to 'spawn'.
+    # This is a common fix for issues with CUDA and other hardware backends (like Ascend NPUs),
+    # as it ensures child processes start with a clean state without inheriting potentially
+    # problematic parent process state.
+    try:
+        mp.set_start_method('spawn', force=True)
+        print("Multiprocessing start method successfully set to 'spawn'.")
+    except RuntimeError as e:
+        # This might happen if the start method has already been set.
+        print(f"Could not set start method: {e}. It might already be set, which is fine.")
+        pass
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to the training configuration file.")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="Path to a checkpoint to resume training from.")
