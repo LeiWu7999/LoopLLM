@@ -1,6 +1,6 @@
 {
     "data_params": {
-        "data_name_or_path": "/root/loop_llm_exp/datasets/packed_data/",
+        "data_name_or_path": "/opt/tiger/packed_data/",
         "max_length": 8192
     },
     "training_params": {
@@ -16,13 +16,13 @@
         "adam_beta2": 0.95,
         "adam_epsilon": 1e-5,
         "lr_scheduler_type": "cosine",
-        "report_to": "tensorboard",
+        "report_to": "wandb",
         "logging_steps": 10,
         "save_strategy": "steps",
-        "save_steps": 100,
+        "save_steps": 2,
         "logging_dir_template": "./logs_{}",
         "eval_strategy": "steps",
-        "eval_steps": 100,
+        "eval_steps": 1,
         "save_total_limit": 5,
         "bf16": true,
         "dataloader_pin_memory": false,
@@ -41,10 +41,10 @@
         "max_loops": 20
     },
     "model_config": {
-        "model_name_or_path": "/root/models/Llama-3.2-1B"
+        "model_name_or_path": "/opt/tiger/Llama-3.2-1B"
     },
     "ppl_eval_config": {
-        "enabled": true,
+        "enabled": false,
         "eval_loop_counts": [1, 4, 8, 12, 16],
         "text_column": "text",
         "window_size": 2048,

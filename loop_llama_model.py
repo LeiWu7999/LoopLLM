@@ -142,41 +142,56 @@ class LoopLlamaModel(LlamaModel):
         layer_idx = 0
         while layer_idx < self.config.num_hidden_layers:
             # 检查当前层是否为循环块的起点
-            
             if layer_idx in self.loop_block_map:
                 block_info = self.loop_block_map[layer_idx]
                 loop_start = layer_idx
                 loop_end = block_info["end_idx"]
-
-                # 优先使用从forward传入的动态loop_count
                 current_loop_count = loop_count if loop_count is not None else block_info["loop_count"]
 
-                # 准备传递给循环执行函数的参数
-                loop_kwargs = {
-                    "attention_mask": causal_mask,
-                    "position_ids": position_ids,
-                    "position_embeddings": position_embeddings,
-                    "past_key_values": past_key_values,
-                    "use_cache": use_cache,
-                    "output_attentions": output_attentions,
-                    "output_hidden_states": output_hidden_states,
-                    "cache_position": cache_position,
-                    "all_hidden_states": all_hidden_states,
-                    "all_self_attns": all_self_attns,
-                    "loop_start": loop_start,
-                    "loop_end": loop_end,
-                    "loop_count": current_loop_count,
-                    "max_loop_count": block_info["max_loop_count"],
-                    "min_loop_count_for_block": block_info["min_loop_count"],
-                }
+                if self.gradient_checkpointing and self.training:
+                    # Custom forward function for the entire loop block
+                    def create_loop_block_forward(hidden_states, **loop_kwargs):
+                        def custom_forward(*_hidden_states):
+                            # The checkpoint function only passes tensor args, so we use the closure for kwargs
+                            return self._execute_loop_layers(hidden_states=_hidden_states[0], **loop_kwargs)
+                        return custom_forward
 
-                # 执行循环块
-                hidden_states, all_hidden_states, all_self_attns = self._execute_loop_layers(
-                    hidden_states=hidden_states,
-                    **loop_kwargs,
-                )
+                    # Prepare kwargs for the loop execution
+                    loop_kwargs = {
+                        "attention_mask": causal_mask, "position_ids": position_ids,
+                        "position_embeddings": position_embeddings, "past_key_values": past_key_values,
+                        "use_cache": use_cache, "output_attentions": output_attentions,
+                        "output_hidden_states": output_hidden_states, "cache_position": cache_position,
+                        "all_hidden_states": all_hidden_states, "all_self_attns": all_self_attns,
+                        "loop_start": loop_start, "loop_end": loop_end, "loop_count": current_loop_count,
+                        "max_loop_count": block_info["max_loop_count"],
+                        "min_loop_count_for_block": block_info["min_loop_count"],
+                    }
+
+                    # Execute the entire loop block under a single checkpoint
+                    outputs = torch.utils.checkpoint.checkpoint(
+                        create_loop_block_forward(hidden_states, **loop_kwargs),
+                        hidden_states,
+                        use_reentrant=False,
+                    )
+                    hidden_states, all_hidden_states, all_self_attns = outputs
+
+                else:
+                    # Non-checkpointed execution of the loop block
+                    loop_kwargs = {
+                        "attention_mask": causal_mask, "position_ids": position_ids,
+                        "position_embeddings": position_embeddings, "past_key_values": past_key_values,
+                        "use_cache": use_cache, "output_attentions": output_attentions,
+                        "output_hidden_states": output_hidden_states, "cache_position": cache_position,
+                        "all_hidden_states": all_hidden_states, "all_self_attns": all_self_attns,
+                        "loop_start": loop_start, "loop_end": loop_end, "loop_count": current_loop_count,
+                        "max_loop_count": block_info["max_loop_count"],
+                        "min_loop_count_for_block": block_info["min_loop_count"],
+                    }
+                    hidden_states, all_hidden_states, all_self_attns = self._execute_loop_layers(
+                        hidden_states=hidden_states, **loop_kwargs
+                    )
                 
-                # 将层索引快进到循环块之后
                 layer_idx = loop_end + 1
             else:
                 if output_hidden_states:
@@ -279,35 +294,16 @@ class LoopLlamaModel(LlamaModel):
                 if output_hidden_states:
                     all_hidden_states += (current_hidden,)
                 
-                if self.gradient_checkpointing and self.training:
-                    def create_custom_forward(module):
-                        def custom_forward(*inputs):
-                            return module(*inputs)
-                        return custom_forward
-
-                    layer_outputs = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(decoder_layer),
-                        current_hidden,
-                        attention_mask,
-                        position_ids,
-                        past_key_values,
-                        output_attentions,
-                        use_cache,
-                        cache_position,
-                        position_embeddings,
-                        use_reentrant=False,
-                    )
-                else:
-                    layer_outputs = decoder_layer(
-                        current_hidden,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
-                        position_embeddings=position_embeddings,
-                    )
+                layer_outputs = decoder_layer(
+                    current_hidden,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                )
                 
                 current_hidden = layer_outputs[0]
                 if output_attentions and layer_outputs[1] is not None:
