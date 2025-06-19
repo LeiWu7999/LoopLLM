@@ -81,6 +81,7 @@ class LoopLlamaModel(LlamaModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        loop_count: Optional[int] = None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
         
@@ -89,7 +90,11 @@ class LoopLlamaModel(LlamaModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        if self.training_mode:
+
+        # 训练时根据配置决定是否禁用KV缓存
+        # use_kv_cache_in_training=False: 无状态循环
+        # use_kv_cache_in_training=True: 有状态循环
+        if self.training_mode and not getattr(self.config, 'use_kv_cache_in_training', True):
             use_cache = False
         
         if input_ids is None and inputs_embeds is None:
@@ -115,6 +120,11 @@ class LoopLlamaModel(LlamaModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)      # [1, seq_len]
         
+        if attention_mask is not None and attention_mask.dim() == 3:
+            # Assume 3D attention_mask is [batch_size, seq_len, seq_len]
+            # and expand it to [batch_size, 1, seq_len, seq_len]
+            attention_mask = attention_mask.unsqueeze(1)
+        
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )       # 4维tensor [batch_size, key_value_length]->[batch_size, 1, query_length, key_value_length]
@@ -122,7 +132,6 @@ class LoopLlamaModel(LlamaModel):
         hidden_states = inputs_embeds
         
         # create position embeddings to be shared across the decoder layers
-        # 不需要
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         
         # decoder layers
@@ -133,35 +142,56 @@ class LoopLlamaModel(LlamaModel):
         layer_idx = 0
         while layer_idx < self.config.num_hidden_layers:
             # 检查当前层是否为循环块的起点
-            
             if layer_idx in self.loop_block_map:
                 block_info = self.loop_block_map[layer_idx]
                 loop_start = layer_idx
                 loop_end = block_info["end_idx"]
+                current_loop_count = loop_count if loop_count is not None else block_info["loop_count"]
 
-                # 执行循环块
-                hidden_states, all_hidden_states, all_self_attns = self._execute_loop_layers(
-                    hidden_states=hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
-                    output_hidden_states=output_hidden_states,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    all_hidden_states=all_hidden_states,
-                    all_self_attns=all_self_attns,
-                    # 循环块特定参数
-                    loop_start=loop_start,
-                    loop_end=loop_end,
-                    loop_count=block_info["loop_count"],
-                    max_loop_count=block_info["max_loop_count"],
-                    min_loop_count_for_block=block_info["min_loop_count"],
-                    **kwargs,
-                )
+                if self.gradient_checkpointing and self.training:
+                    # Custom forward function for the entire loop block
+                    def create_loop_block_forward(hidden_states, **loop_kwargs):
+                        def custom_forward(*_hidden_states):
+                            # The checkpoint function only passes tensor args, so we use the closure for kwargs
+                            return self._execute_loop_layers(hidden_states=_hidden_states[0], **loop_kwargs)
+                        return custom_forward
+
+                    # Prepare kwargs for the loop execution
+                    loop_kwargs = {
+                        "attention_mask": causal_mask, "position_ids": position_ids,
+                        "position_embeddings": position_embeddings, "past_key_values": past_key_values,
+                        "use_cache": use_cache, "output_attentions": output_attentions,
+                        "output_hidden_states": output_hidden_states, "cache_position": cache_position,
+                        "all_hidden_states": all_hidden_states, "all_self_attns": all_self_attns,
+                        "loop_start": loop_start, "loop_end": loop_end, "loop_count": current_loop_count,
+                        "max_loop_count": block_info["max_loop_count"],
+                        "min_loop_count_for_block": block_info["min_loop_count"],
+                    }
+
+                    # Execute the entire loop block under a single checkpoint
+                    outputs = torch.utils.checkpoint.checkpoint(
+                        create_loop_block_forward(hidden_states, **loop_kwargs),
+                        hidden_states,
+                        use_reentrant=False,
+                    )
+                    hidden_states, all_hidden_states, all_self_attns = outputs
+
+                else:
+                    # Non-checkpointed execution of the loop block
+                    loop_kwargs = {
+                        "attention_mask": causal_mask, "position_ids": position_ids,
+                        "position_embeddings": position_embeddings, "past_key_values": past_key_values,
+                        "use_cache": use_cache, "output_attentions": output_attentions,
+                        "output_hidden_states": output_hidden_states, "cache_position": cache_position,
+                        "all_hidden_states": all_hidden_states, "all_self_attns": all_self_attns,
+                        "loop_start": loop_start, "loop_end": loop_end, "loop_count": current_loop_count,
+                        "max_loop_count": block_info["max_loop_count"],
+                        "min_loop_count_for_block": block_info["min_loop_count"],
+                    }
+                    hidden_states, all_hidden_states, all_self_attns = self._execute_loop_layers(
+                        hidden_states=hidden_states, **loop_kwargs
+                    )
                 
-                # 将层索引快进到循环块之后
                 layer_idx = loop_end + 1
             else:
                 if output_hidden_states:
@@ -169,17 +199,35 @@ class LoopLlamaModel(LlamaModel):
                 # 执行单个普通层
                 decoder_layer = self.layers[layer_idx]
                 
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
+                if self.gradient_checkpointing and self.training:
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs)
+                        return custom_forward
+
+                    layer_outputs = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(decoder_layer),
+                        hidden_states,
+                        causal_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                        position_embeddings,
+                        use_reentrant=False,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                    )
                 
                 hidden_states = layer_outputs[0]
                 
@@ -207,12 +255,12 @@ class LoopLlamaModel(LlamaModel):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
         output_hidden_states: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         all_hidden_states: Optional[Tuple[torch.Tensor]] = None,
         all_self_attns: Optional[Tuple[torch.Tensor]] = None,
         # 循环块参数
@@ -221,7 +269,6 @@ class LoopLlamaModel(LlamaModel):
         loop_count: int = 0,
         max_loop_count: int = 0,
         min_loop_count_for_block: int = 0,
-        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         执行循环层的逻辑
@@ -246,7 +293,6 @@ class LoopLlamaModel(LlamaModel):
             for relative_idx, decoder_layer in enumerate(loop_layers):
                 if output_hidden_states:
                     all_hidden_states += (current_hidden,)
-                layer_idx = loop_start + relative_idx   # 没用
                 
                 layer_outputs = decoder_layer(
                     current_hidden,
@@ -257,7 +303,6 @@ class LoopLlamaModel(LlamaModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
-                    **kwargs,
                 )
                 
                 current_hidden = layer_outputs[0]
@@ -318,6 +363,24 @@ class LoopLlamaModel(LlamaModel):
         # 这里简化实现，只使用余弦相似度
         return False
 
+    # This is the method that will be called by the Trainer
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """
+        Activates gradient checkpointing for the model.
+        We override the default behavior to apply checkpointing at the loop level.
+        """
+        if not self.supports_gradient_checkpointing:
+            raise ValueError("This model does not support gradient checkpointing.")
+        self.gradient_checkpointing = True
+        print("Manual gradient checkpointing enabled for LoopLlamaModel.")
+
+    def gradient_checkpointing_disable(self):
+        """
+        Deactivates gradient checkpointing for the model.
+        """
+        self.gradient_checkpointing = False
+        print("Manual gradient checkpointing disabled for LoopLlamaModel.")
+
 
 class LoopLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     """
@@ -366,6 +429,7 @@ class LoopLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        loop_count: Optional[int] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         
@@ -385,6 +449,7 @@ class LoopLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
+            loop_count=loop_count,
             **kwargs,
         )
         

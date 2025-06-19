@@ -54,6 +54,8 @@ Thumbs.db
 
 # Logs
 *.log
+train/logs_*
+train/my_loop_llama_output*
 
 # Temporary files
 *.tmp
