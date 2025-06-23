@@ -300,6 +300,12 @@ class LoopLlamaModel(LlamaModel):
         执行循环层的逻辑
         """
         if loop_count <= 0:
+            # if output_hidden_states:
+            #     # When skipping the loop, we treat the layers as identity functions.
+            #     # The input to each layer in the block is the same `hidden_states` tensor.
+            #     # This is crucial to keep the `all_hidden_states` indexing consistent.
+            #     for _ in range(loop_start, loop_end + 1):
+            #         all_hidden_states += (hidden_states,)
             return hidden_states, all_hidden_states, all_self_attns
             
         loop_layers = self.layers[loop_start:loop_end + 1]

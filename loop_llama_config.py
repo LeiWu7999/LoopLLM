@@ -19,7 +19,7 @@ class LoopLlamaConfig(LlamaConfig):
         cosine_threshold: float = 0.95,  # 余弦相似度阈值
         kl_threshold: float = 0.01,  # KL散度阈值
 
-        max_loop_count: Union[int, List[int]] = 10,  # 最大循环次数，可为单个整数或列表
+        max_loop_count: Union[int, List[int]] = 20,  # 最大循环次数，可为单个整数或列表
         
         # 训练时是否启用动态循环次数采样
         use_dynamic_loop_sampling: bool = False,
