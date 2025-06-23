@@ -7,6 +7,10 @@ import os
 # 挂梯子加载数据集
 # os.environ["http_proxy"] = "http://127.0.0.1:7891"
 # os.environ["https_proxy"] = "http://127.0.0.1:7891"
+import sys
+
+# 添加LoopLLM目录到路径
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import torch
 import torch.nn.functional as F
@@ -385,11 +389,11 @@ class LoopLLMInterpreter:
         # 添加循环层标记线
         if self.config.loop_layers is not None:
             start_layer, end_layer = self.config.loop_layers
-            real_end_layer = start_layer + self.config.loop_count * (end_layer - start_layer + 1) - 1
+            real_end_layer = start_layer + self.config.loop_count * (end_layer - start_layer + 1)
             
             # 计算循环层在相对位置中的坐标
-            start_relative = start_layer / (num_layers - 1) if num_layers > 1 else 0
-            end_relative = real_end_layer / (num_layers - 1) if num_layers > 1 else 0
+            start_relative = start_layer / (num_layers) if num_layers > 1 else 0
+            end_relative = real_end_layer / (num_layers) if num_layers > 1 else 0
             
             # 添加循环开始和结束的垂直线
             plt.axvline(x=start_relative, color='red', linestyle='--', linewidth=2, alpha=0.8)

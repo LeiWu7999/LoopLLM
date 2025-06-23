@@ -140,7 +140,7 @@ class LoopCache(Cache):
         if virtual_idx not in cache_dict[layer_idx]:
             # 首次添加
             cache_dict[layer_idx][virtual_idx] = new_tensor
-        elif self.current_forward_loop_step < self.virtual_layer_count:
+        elif self.current_forward_loop_step < virtual_layer_count:
             # 第一轮循环,直接拼接
             cache_dict[layer_idx][virtual_idx] = torch.cat([
                 cache_dict[layer_idx][virtual_idx], new_tensor
@@ -152,7 +152,7 @@ class LoopCache(Cache):
                 # 先将cache_dict[layer_idx]所有cache最后一个token向前移一个位置
                 for current_vitual_idx in range(0, final_idx):
                     current_vitual_cache = cache_dict[layer_idx][current_vitual_idx][:, :, :-1, :]
-                    next_vitual_last_token = cache_dict[layer_idx][current_vitual_idx + 1][:, :, -1, :]
+                    next_vitual_last_token = cache_dict[layer_idx][current_vitual_idx + 1][:, :, -1:, :]
                     cache_dict[layer_idx][current_vitual_idx] = torch.cat([
                         current_vitual_cache, next_vitual_last_token
                     ], dim=-2)
@@ -267,11 +267,14 @@ class LoopCache(Cache):
     
     def finish_current_forward_loops(self):
         """完成当前forward的循环，合并结果到历史缓存"""
+        print(f"cache usage: {self.get_memory_usage()}")
         if self.kv_cache_mode == "merge_strategy":
-            for layer_idx in self.current_forward_key_history:
-                if self.current_forward_key_history[layer_idx]:
+            # 使用 list() 复制键，以便在循环中安全地修改字典或其内容
+            for layer_idx in list(self.current_forward_key_history.keys()):
+                # 只有在存在循环历史时才进行合并
+                if self.current_forward_key_history.get(layer_idx):
                     merged_key, merged_value = self._merge_current_forward_history(layer_idx)
-                    
+
                     # 更新历史缓存
                     if layer_idx in self.merged_key_cache:
                         self.merged_key_cache[layer_idx] = torch.cat([
@@ -283,6 +286,11 @@ class LoopCache(Cache):
                     else:
                         self.merged_key_cache[layer_idx] = merged_key
                         self.merged_value_cache[layer_idx] = merged_value
+                    
+                    # 合并后立即清空当前token的循环历史记录，释放内存
+                    self.current_forward_key_history[layer_idx].clear()
+                    self.current_forward_value_history[layer_idx].clear()
+        
     
     def _merge_current_forward_history(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """合并当前forward的循环历史"""
@@ -327,7 +335,7 @@ class LoopCache(Cache):
         """
         # 统一返回真实的token序列长度，而不是缓存的内部长度
         # 这确保了position_ids的正确性，避免干扰RoPE位置编码
-        
+        return self._seen_tokens
         if self.is_loop_layer(layer_idx):
             if self.kv_cache_mode == "virtual_layers":
                 # 虚拟层模式：返回真实序列长度
@@ -345,7 +353,7 @@ class LoopCache(Cache):
                 if layer_idx in self.merged_key_cache:
                     length += self.merged_key_cache[layer_idx].shape[-2]
                 # 当前forward只处理一个token，所以加1
-                if self.current_forward_key_history[layer_idx]:
+                if self.current_forward_key_history.get(layer_idx, None) is not None:
                     length += 1  # 当前token
                 return length
         else:
@@ -381,9 +389,8 @@ class LoopCache(Cache):
                 if layer_idx in self.merged_key_cache:
                     length += self.merged_key_cache[layer_idx].shape[-2]
                 # 加上当前forward的循环历史长度
-                if self.current_forward_key_history[layer_idx]:
-                    for key_tensor in self.current_forward_key_history[layer_idx]:
-                        length += key_tensor.shape[-2]
+                if self.current_forward_key_history.get(layer_idx, None) is not None:
+                    length += self.current_forward_key_history[layer_idx][-1].shape[-2]  # 当前token
                 return length
         else:
             if len(self.key_cache) <= layer_idx or self.key_cache[layer_idx] is None:
@@ -393,3 +400,73 @@ class LoopCache(Cache):
     def get_max_cache_shape(self) -> Optional[int]:
         """返回最大缓存容量"""
         return None  # 动态缓存，无固定上限 
+
+    def get_memory_usage(self) -> float:
+        """计算当前缓存占用的内存（MB）"""
+        all_bytes = 0
+        total_bytes = 0
+        
+        # 创建或打开日志文件
+        with open("cache_usage_log.txt", "a") as log_file:
+            # 1. 计算普通层缓存
+            for key_tensor in self.key_cache:
+                if key_tensor is not None:
+                    total_bytes += key_tensor.nelement() * key_tensor.element_size()
+            log_file.write(f"key_cache: {total_bytes / (1024 * 1024)} GB\n")
+            all_bytes += total_bytes
+            
+            total_bytes = 0
+            for value_tensor in self.value_cache:
+                if value_tensor is not None:
+                    total_bytes += value_tensor.nelement() * value_tensor.element_size()
+            log_file.write(f"value_cache: {total_bytes / (1024 * 1024)} GB\n")
+            all_bytes += total_bytes
+
+            # 2. 根据不同策略计算循环层缓存
+            if self.kv_cache_mode == "virtual_layers":
+                # 虚拟层模式
+                total_bytes = 0
+                for layer_cache in self.virtual_key_cache.values():
+                    for key_tensor in layer_cache.values():
+                        total_bytes += key_tensor.nelement() * key_tensor.element_size()
+                log_file.write(f"virtual_key_cache: {total_bytes / (1024 * 1024)} GB\n")
+                all_bytes += total_bytes
+                
+                total_bytes = 0
+                for layer_cache in self.virtual_value_cache.values():
+                    for value_tensor in layer_cache.values():
+                        total_bytes += value_tensor.nelement() * value_tensor.element_size()
+                log_file.write(f"virtual_value_cache: {total_bytes / (1024 * 1024)} GB\n")
+                all_bytes += total_bytes
+
+            elif self.kv_cache_mode == "merge_strategy":
+                # 合并策略模式
+                total_bytes = 0
+                for key_tensor in self.merged_key_cache.values():
+                    total_bytes += key_tensor.nelement() * key_tensor.element_size()
+                log_file.write(f"merged_key_cache: {total_bytes / (1024 * 1024)} GB\n")
+                all_bytes += total_bytes
+
+                total_bytes = 0
+                for value_tensor in self.merged_value_cache.values():
+                    total_bytes += value_tensor.nelement() * value_tensor.element_size()
+                log_file.write(f"merged_value_cache: {total_bytes / (1024 * 1024)} GB\n")
+                all_bytes += total_bytes
+                
+                total_bytes = 0
+                for key_history in self.current_forward_key_history.values():
+                    for key_tensor in key_history:
+                        total_bytes += key_tensor.nelement() * key_tensor.element_size()
+                log_file.write(f"current_forward_key_history: {total_bytes / (1024 * 1024)} GB\n")
+                all_bytes += total_bytes
+                
+                total_bytes = 0
+                for value_history in self.current_forward_value_history.values():
+                    for value_tensor in value_history:
+                        total_bytes += value_tensor.nelement() * value_tensor.element_size()
+                log_file.write(f"current_forward_value_history: {total_bytes / (1024 * 1024)} GB\n")
+                all_bytes += total_bytes
+            
+            log_file.write(f"总内存使用: {all_bytes / (1024 * 1024)} GB\n\n")
+        
+        return all_bytes / (1024 * 1024)
