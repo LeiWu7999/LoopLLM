@@ -217,14 +217,18 @@ class CustomLoggingTrainer(Trainer):
             
         return (outputs.loss, outputs) if return_outputs else outputs.loss
 
-    def log(self, logs: Dict[str, float]) -> None:
+    def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
         """
         重写log方法，将我们保存的辅助损失添加到日志中。
+        为了兼容不同版本的`transformers.Trainer`，其`log`方法的签名可能变化（例如，增加了额外的参数），
+        我们使用`*args`和`**kwargs`来捕獲所有传递给`log`的参数，以确保前向兼容性。
         """
         if self.is_in_train and self._current_train_losses:
             logs.update(self._current_train_losses)
+            # 清空已记录的损失，为下一个logging step做准备
+            self._current_train_losses = {}
         
-        super().log(logs)
+        super().log(logs, *args, **kwargs)
   
 def CPT_train(loop_llama_model, dataset, tokenizer, training_config, resume_from_checkpoint=None, freeze=False):
     if freeze and loop_llama_model.config.loop_layers:
