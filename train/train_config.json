@@ -19,23 +19,26 @@
         "report_to": "wandb",
         "logging_steps": 10,
         "save_strategy": "steps",
-        "save_steps": 2,
+        "save_steps": 100,
         "logging_dir_template": "./logs_{}",
         "eval_strategy": "steps",
-        "eval_steps": 1,
+        "eval_steps": 100,
         "per_device_eval_batch_size": 1,
+        "eval_on_start": true,
         "save_total_limit": 5,
         "bf16": true,
         "dataloader_pin_memory": false,
         "remove_unused_columns": false
     },
     "loop_config": {
-        "use_loop": false,
+        "use_loop": true,
         "loop_layers": [[6, 8]],
         "loop_strategy": "fixed_count",
         "loop_count": [5],
         "use_dynamic_loop_sampling": true,
-        "use_kv_cache_in_training": false
+        "use_kv_cache_in_training": false,
+        "aux_loss_weight": 0.1,
+        "aux_loss_margin": 0.05
     },
     "dynamic_sampling_params": {
         "r_bar": 5.0,
@@ -44,12 +47,5 @@
     },
     "model_config": {
         "model_name_or_path": "/opt/tiger/Llama-3.2-1B"
-    },
-    "ppl_eval_config": {
-        "enabled": false,
-        "eval_loop_counts": [1, 4, 8, 12, 16],
-        "text_column": "text",
-        "window_size": 2048,
-        "stride": 512
     }
 } 

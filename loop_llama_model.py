@@ -22,28 +22,19 @@ from loop_llama_config import LoopLlamaConfig
 from loop_cache_utils import LoopCache
 
 @dataclass
-class LoopModelOutputWithPast(ModelOutput):
+class LoopModelOutputWithPast(BaseModelOutputWithPast):
     """
     继承自BaseModelOutputWithPast，额外包含one_loop_hidden用于辅助损失计算
     """
-    last_hidden_state: torch.FloatTensor = None
-    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     # 新增字段：用于辅助损失计算的one_loop_hidden
     one_loop_hidden: Optional[torch.FloatTensor] = None
 
 
 @dataclass
-class LoopCausalLMOutputWithPast(ModelOutput):
+class LoopCausalLMOutputWithPast(CausalLMOutputWithPast):
     """
     继承自CausalLMOutputWithPast，额外包含辅助损失信息
     """
-    loss: Optional[torch.FloatTensor] = None
-    logits: torch.FloatTensor = None
-    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     # 新增字段：辅助损失相关信息
     aux_loss: Optional[torch.FloatTensor] = None
     loss_pre_loop: Optional[torch.FloatTensor] = None
@@ -67,8 +58,6 @@ class LoopLlamaModel(LlamaModel):
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.rotary_emb = LlamaRotaryEmbedding(config)
-        
-        self.gradient_checkpointing = False
         
         self.training_mode = None
         
@@ -170,7 +159,7 @@ class LoopLlamaModel(LlamaModel):
         # --- 层执行逻辑 ---
         layer_idx = 0
         if self.training:
-            one_loop_hidden = hidden_states.clone()
+            one_loop_hidden = hidden_states.clone().detach()
         else:
             one_loop_hidden = None
         while layer_idx < self.config.num_hidden_layers:
@@ -181,48 +170,43 @@ class LoopLlamaModel(LlamaModel):
                 loop_end = block_info["end_idx"]
                 current_loop_count = loop_count if loop_count is not None else block_info["loop_count"]
 
-                if self.gradient_checkpointing and self.training:
-                    # Custom forward function for the entire loop block
-                    def create_loop_block_forward(hidden_states, **loop_kwargs):
-                        def custom_forward(*_hidden_states):
-                            # The checkpoint function only passes tensor args, so we use the closure for kwargs
-                            return self._execute_loop_layers(hidden_states=_hidden_states[0], **loop_kwargs)
-                        return custom_forward
-
-                    # Prepare kwargs for the loop execution
-                    loop_kwargs = {
-                        "attention_mask": causal_mask, "position_ids": position_ids,
-                        "position_embeddings": position_embeddings, "past_key_values": past_key_values,
-                        "use_cache": use_cache, "output_attentions": output_attentions,
-                        "output_hidden_states": output_hidden_states, "cache_position": cache_position,
-                        "all_hidden_states": all_hidden_states, "all_self_attns": all_self_attns,
-                        "loop_start": loop_start, "loop_end": loop_end, "loop_count": current_loop_count,
-                        "max_loop_count": block_info["max_loop_count"],
-                        "min_loop_count_for_block": block_info["min_loop_count"],
-                    }
-
                 # 执行循环块
                 hidden_states, all_hidden_states, all_self_attns = self._execute_loop_layers(
                     hidden_states=hidden_states,
-                    **loop_kwargs,
-                )
-                if one_loop_hidden is not None:
-                    one_loop_hidden, all_hidden_states, all_self_attns = self._execute_loop_layers(
-                    hidden_states=one_loop_hidden,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
-                    use_cache=False,
                     position_embeddings=position_embeddings,
-                    output_attentions=False,
-                    output_hidden_states=False,
-                    # 循环块特定参数
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    cache_position=cache_position,
+                    all_hidden_states=all_hidden_states,
+                    all_self_attns=all_self_attns,
                     loop_start=loop_start,
                     loop_end=loop_end,
-                    loop_count=1,
+                    loop_count=current_loop_count,
                     max_loop_count=block_info["max_loop_count"],
                     min_loop_count_for_block=block_info["min_loop_count"],
-                    **kwargs,
                 )
+                if one_loop_hidden is not None:
+                    with torch.no_grad():
+                        one_loop_hidden, _, _ = self._execute_loop_layers(
+                        hidden_states=one_loop_hidden,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        use_cache=False,
+                        position_embeddings=position_embeddings,
+                        output_attentions=False,
+                        output_hidden_states=False,
+                        # 循环块特定参数
+                        loop_start=loop_start,
+                        loop_end=loop_end,
+                        loop_count=1,
+                        max_loop_count=block_info["max_loop_count"],
+                        min_loop_count_for_block=block_info["min_loop_count"],
+                        past_key_values=None, # 明确不使用缓存
+                    )
                 # 将层索引快进到循环块之后
                 layer_idx = loop_end + 1
             else:
@@ -242,18 +226,18 @@ class LoopLlamaModel(LlamaModel):
                     position_embeddings=position_embeddings,
                 )
                 if one_loop_hidden is not None:
-                    layer_outputs_aux = decoder_layer(
-                        one_loop_hidden,
-                        attention_mask=causal_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
-                        position_embeddings=position_embeddings,
-                        **kwargs,
-                    )
-                    one_loop_hidden = layer_outputs_aux[0]
+                    with torch.no_grad():
+                        layer_outputs_aux = decoder_layer(
+                            one_loop_hidden,
+                            attention_mask=causal_mask,
+                            position_ids=position_ids,
+                            past_key_value=None, # 明确不使用缓存
+                            output_attentions=False, # 明确不计算attention
+                            use_cache=False, # 明确不使用缓存
+                            cache_position=cache_position,
+                            position_embeddings=position_embeddings,
+                        )
+                        one_loop_hidden = layer_outputs_aux[0]
                 hidden_states = layer_outputs[0]
                 
                 if output_attentions:
@@ -263,6 +247,8 @@ class LoopLlamaModel(LlamaModel):
                 layer_idx += 1
         
         hidden_states = self.norm(hidden_states)
+        if one_loop_hidden is not None:
+            one_loop_hidden = self.norm(one_loop_hidden)
         
         # add hidden states from the last decoder layer
         if output_hidden_states:
@@ -395,24 +381,6 @@ class LoopLlamaModel(LlamaModel):
         # 这里简化实现，只使用余弦相似度
         return False
 
-    # This is the method that will be called by the Trainer
-    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
-        """
-        Activates gradient checkpointing for the model.
-        We override the default behavior to apply checkpointing at the loop level.
-        """
-        if not self.supports_gradient_checkpointing:
-            raise ValueError("This model does not support gradient checkpointing.")
-        self.gradient_checkpointing = True
-        print("Manual gradient checkpointing enabled for LoopLlamaModel.")
-
-    def gradient_checkpointing_disable(self):
-        """
-        Deactivates gradient checkpointing for the model.
-        """
-        self.gradient_checkpointing = False
-        print("Manual gradient checkpointing disabled for LoopLlamaModel.")
-
 
 class LoopLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     """
@@ -492,46 +460,54 @@ class LoopLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         
         loss = None
         aux_loss = None
-        loss_pre_loop = None
+        loss_pre_loop_val = None
         loss_post_loop = None
         
         if labels is not None:
             # print(kwargs['num_items_in_batch'])
             if self.training:
-                
-                logits = logits.float()
-                # Shift so that tokens < n predict n
+                # 统一处理 labels, 避免在两个地方重复移动到device
                 labels = nn.functional.pad(labels, (0, 1), value=-100)
                 shift_labels = labels[..., 1:].contiguous()
-                # Flatten the tokens
-                logits = logits.view(-1, self.config.vocab_size)
                 shift_labels = shift_labels.view(-1)
-                # Enable model parallelism
+                
+                # 步骤1: 首先计算辅助损失中的 loss_pre_loop
+                # 目的是先完成这部分的计算，并及时释放内存，从而降低峰值内存占用
+                aux_loss = torch.tensor(0.0, device=logits.device)
+                loss_pre_loop_val = None # 用于保存loss_pre_loop的标量值
+
+                if outputs.one_loop_hidden is not None:
+                    # 使用 no_grad 确保这部分计算不构建计算图
+                    with torch.no_grad():
+                        # 计算 one_loop_hidden 对应的 logits
+                        one_loop_logits = self.lm_head(outputs.one_loop_hidden[:, slice_indices, :])
+                        one_loop_logits = one_loop_logits.float()
+                        one_loop_logits = one_loop_logits.view(-1, self.config.vocab_size)
+                        
+                        # 计算循环前的损失 Loss_pre_loop
+                        shift_labels_gpu = shift_labels.to(one_loop_logits.device)
+                        loss_pre_loop = nn.functional.cross_entropy(one_loop_logits, shift_labels_gpu, ignore_index=-100, reduction="sum")
+                        loss_pre_loop = loss_pre_loop / kwargs['num_items_in_batch']
+                        loss_pre_loop_val = loss_pre_loop.item()
+                    
+                    # 步骤2: 手动释放不再需要的张量，清空缓存，进一步降低内存
+                    del one_loop_logits, loss_pre_loop, shift_labels_gpu
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                # 步骤3: 计算主损失 Loss_post_loop，这部分会构建用于反向传播的计算图
+                logits = logits.float()
+                logits = logits.view(-1, self.config.vocab_size)
                 shift_labels = shift_labels.to(logits.device)
                 
-                # 主损失 Loss_post_loop
                 loss_post_loop = nn.functional.cross_entropy(logits, shift_labels, ignore_index=-100, reduction="sum")
                 loss_post_loop = loss_post_loop / kwargs['num_items_in_batch']
-                
-                # 辅助损失计算
-                aux_loss = torch.tensor(0.0, device=logits.device)
-                if outputs.one_loop_hidden is not None:
-                    # 计算 one_loop_hidden 对应的 logits (Loss_pre_loop)
-                    one_loop_logits = self.lm_head(outputs.one_loop_hidden[:, slice_indices, :])
-                    one_loop_logits = one_loop_logits.float()
-                    one_loop_logits = one_loop_logits.view(-1, self.config.vocab_size)
-                    
-                    # 计算循环前的损失 Loss_pre_loop
-                    loss_pre_loop = nn.functional.cross_entropy(one_loop_logits, shift_labels, ignore_index=-100, reduction="sum")
-                    loss_pre_loop = loss_pre_loop / kwargs['num_items_in_batch']
-                    
-                    # Hinge Loss: max(0, Loss_post_loop - Loss_pre_loop + margin)
+
+                # 步骤4: 使用之前计算出的 loss_pre_loop_val 计算 Hinge Loss
+                if loss_pre_loop_val is not None:
                     margin = self.config.aux_loss_margin
-                    aux_loss = torch.clamp(loss_post_loop - loss_pre_loop + margin / (kwargs['num_items_in_batch'] / logits.shape[0]), min=0.0)
-                    
-                    # 可选：添加调试信息（需要时取消注释）
-                    # if torch.distributed.get_rank() == 0:  # 只在主进程打印
-                    #     print(f"Loss_pre: {loss_pre_loop:.4f}, Loss_post: {loss_post_loop:.4f}, Aux_loss: {aux_loss:.4f}")
+                    # 这里 loss_pre_loop_val 是一个标量，等效于 loss_pre_loop.detach()，不会引入额外的计算图
+                    aux_loss = torch.clamp(loss_post_loop - loss_pre_loop_val + margin / (kwargs['num_items_in_batch'] / logits.shape[0]), min=0.0)
                 
                 # 总损失: Loss_total = Loss_post_loop + α * Loss_aux
                 alpha = self.config.aux_loss_weight
@@ -540,13 +516,13 @@ class LoopLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             else:
                 loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
         
-        return CausalLMOutputWithPast(
+        return LoopCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             aux_loss=aux_loss,
-            loss_pre_loop=loss_pre_loop,
+            loss_pre_loop=loss_pre_loop_val,
             loss_post_loop=loss_post_loop,
         ) 

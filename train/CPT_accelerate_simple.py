@@ -186,87 +186,45 @@ class DynamicLoopCountDataCollatorForCrossDocumentAttention:
             "loop_count": sampled_loop_count
         }
 
-class PplValidationTrainer(Trainer):
-    def __init__(self, *args, eval_loop_counts: List[int] = None, text_column_name: str = 'text', ppl_window_size: int = 2048, ppl_stride: int = 512, **kwargs):
+class CustomLoggingTrainer(Trainer):
+    """
+    自定义Trainer，用于在训练日志中记录额外的损失信息（如aux_loss）。
+    """
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.eval_loop_counts = eval_loop_counts if eval_loop_counts is not None else []
-        self.text_column_name = text_column_name
-        self.ppl_window_size = ppl_window_size
-        self.ppl_stride = ppl_stride
-        if not self.eval_loop_counts:
-             print("Warning: PplValidationTrainer initialized but 'eval_loop_counts' is empty or not provided.")
-        if not isinstance(self.tokenizer, PreTrainedTokenizerBase):
-            raise ValueError("PplValidationTrainer requires a tokenizer to be passed to its constructor.")
+        # 用于保存训练过程中的辅助损失值
+        self._current_train_losses = {}
 
-    def evaluate(self, eval_dataset: Optional[torch.utils.data.Dataset] = None, ignore_keys: Optional[List[str]] = None, metric_key_prefix: str = "eval") -> Dict[str, float]:
-        output = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """
+        重写compute_loss以捕获并保存辅助损失。
+        """
+        # 将 Trainer 传递的额外参数（如 num_items_in_batch）注入到模型输入中，
+        # 这样模型内部就可以用它来做损失归一化。
+        if 'num_items_in_batch' in kwargs:
+            inputs['num_items_in_batch'] = kwargs['num_items_in_batch']
 
-        if not self.eval_loop_counts:
-            return output
-
-        print("\nStarting PPL evaluation with multiple loop counts...")
+        outputs = model(**inputs)
         
-        _eval_dataset = self.eval_dataset if eval_dataset is None else eval_dataset
-        
-        print("Preparing validation data for PPL calculation...")
-        
-        # The dataset from tokenize_and_pack.py is pre-tokenized, so we should use 'input_ids' directly.
-        if "input_ids" in _eval_dataset.features:
-            print("Concatenating pre-tokenized 'input_ids' from the validation set...")
-            all_tokens = [token for sample in _eval_dataset for token in sample['input_ids']]
-            if not all_tokens:
-                print("Warning: PPL eval - validation dataset is empty or 'input_ids' column yielded no tokens.")
-                return output
-            # The shape needs to be (batch_size, sequence_length), so (1, N) for the full sequence.
-            encodings = {"input_ids": torch.tensor([all_tokens], dtype=torch.long)}
-        else:
-            # Fallback for text-based datasets for backward compatibility or different data prep.
-            print(f"Warning: 'input_ids' not found. Falling back to tokenizing text from column '{self.text_column_name}'. This is inefficient for pre-packed data.")
-            if self.text_column_name not in _eval_dataset.features:
-                print(f"Text column '{self.text_column_name}' not found. Searching for other potential text columns...")
-                potential_text_cols = [col for col in ['text', 'content', 'document'] if col in _eval_dataset.features]
-                if not potential_text_cols:
-                    print(f"Error: Neither 'input_ids' nor a valid text column found in dataset features: {list(_eval_dataset.features.keys())}. Aborting PPL evaluation.")
-                    return output
-                self.text_column_name = potential_text_cols[0]
-                print(f"Found and using text column: '{self.text_column_name}'.")
-
-            full_text = "\n\n".join(d[self.text_column_name] for d in _eval_dataset if d.get(self.text_column_name))
-            if not full_text:
-                print("Warning: PPL eval - validation dataset is empty or text column yielded no text.")
-                return output
-            encodings = self.tokenizer(full_text, return_tensors="pt", truncation=False)
-
-        ppl_results = {}
-        unwrapped_model = self.accelerator.unwrap_model(self.model)
-        original_loop_count = unwrapped_model.loop_count
-        
-        print(f"Performing PPL evaluation for loop counts: {self.eval_loop_counts}")
-        for loop_count in self.eval_loop_counts:
-            print(f"Evaluating PPL with loop_count = {loop_count}")
-            unwrapped_model.config.loop_count = loop_count
-            unwrapped_model.loop_count = loop_count
-
-            ppl, nll = calculate_ppl_loss(
-                self.model,
-                self.tokenizer, 
-                encodings, 
-                self.accelerator.device,
-                window_size=self.ppl_window_size, 
-                stride=self.ppl_stride
-            )
+        # 仅在训练阶段保存这些损失，避免影响评估逻辑
+        if self.is_in_train:
+            if outputs.aux_loss is not None:
+                self._current_train_losses['train/aux_loss'] = outputs.aux_loss.item()
+            if outputs.loss_pre_loop is not None:
+                self._current_train_losses['train/loss_pre_loop'] = outputs.loss_pre_loop
+            if outputs.loss_post_loop is not None:
+                self._current_train_losses['train/loss_post_loop'] = outputs.loss_post_loop.item()
             
-            print(f"  -> PPL (loops={loop_count}): {ppl:.4f}, NLL: {nll:.4f}")
-            ppl_results[f"{metric_key_prefix}/ppl_loops_{loop_count}"] = ppl
-            ppl_results[f"{metric_key_prefix}/nll_loops_{loop_count}"] = nll
+        return (outputs.loss, outputs) if return_outputs else outputs.loss
 
-        unwrapped_model.config.loop_count = original_loop_count
-        unwrapped_model.loop_count = original_loop_count
+    def log(self, logs: Dict[str, float]) -> None:
+        """
+        重写log方法，将我们保存的辅助损失添加到日志中。
+        """
+        if self.is_in_train and self._current_train_losses:
+            logs.update(self._current_train_losses)
         
-        self.log(ppl_results)
-        output.metrics.update(ppl_results)
-        
-        return output
+        super().log(logs)
   
 def CPT_train(loop_llama_model, dataset, tokenizer, training_config, resume_from_checkpoint=None, freeze=False):
     if freeze and loop_llama_model.config.loop_layers:
@@ -314,7 +272,6 @@ def CPT_train(loop_llama_model, dataset, tokenizer, training_config, resume_from
         num_train_epochs=training_config['training_params']['num_train_epochs'],
         per_device_train_batch_size=training_config['training_params']['per_device_train_batch_size'],
         gradient_accumulation_steps=training_config['training_params']['gradient_accumulation_steps'],
-        gradient_checkpointing=training_config['training_params']['gradient_checkpointing'],
         learning_rate=training_config['training_params']['learning_rate'],
         warmup_steps=training_config['training_params']['warmup_steps'],
         weight_decay=training_config['training_params']['weight_decay'],
@@ -333,33 +290,18 @@ def CPT_train(loop_llama_model, dataset, tokenizer, training_config, resume_from
         dataloader_pin_memory=training_config['training_params']['dataloader_pin_memory'],
         remove_unused_columns=training_config['training_params']['remove_unused_columns'],
         per_device_eval_batch_size=training_config['training_params']['per_device_eval_batch_size'],
+        eval_on_start=training_config['training_params']['eval_on_start'],
         # prediction_loss_only=True,
         # eval_accumulation_steps=1,
-        # eval_on_start=True,
     )
     
-    ppl_eval_config = training_config.get('ppl_eval_config')
-    trainer_class = Trainer
-    trainer_init_kwargs = {}
-
-    if ppl_eval_config and ppl_eval_config.get('enabled', False):
-        print("Enabling PPL validation during training.")
-        trainer_class = PplValidationTrainer
-        trainer_init_kwargs = {
-            'eval_loop_counts': ppl_eval_config['eval_loop_counts'],
-            'text_column_name': ppl_eval_config.get('text_column', 'text'),
-            'ppl_window_size': ppl_eval_config.get('window_size', 2048),
-            'ppl_stride': ppl_eval_config.get('stride', 512),
-        }
-
-    trainer = trainer_class(
+    trainer = CustomLoggingTrainer(
         model=loop_llama_model,
         args=training_args,
         train_dataset=dataset["train"],
         eval_dataset=dataset["validation"], 
         data_collator=data_collator,
         tokenizer=tokenizer,
-        **trainer_init_kwargs
     )
     
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
